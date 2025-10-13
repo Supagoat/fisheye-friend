@@ -1,0 +1,119 @@
+// TPSWarp.compute
+#pragma kernel WarpLanc
+
+// Textures
+Texture2D<float4> _Src;
+RWTexture2D<float4> _Dst;
+SamplerState sampler_LinearClamp;
+
+// TPS control arrays for tx (mapping to sx) and ty (mapping to sy)
+StructuredBuffer<float> _TxX;
+StructuredBuffer<float> _TxY;
+StructuredBuffer<float> _TxW;
+StructuredBuffer<float> _TyX;
+StructuredBuffer<float> _TyY;
+StructuredBuffer<float> _TyW;
+
+// Packed coefficients + sizes
+// dims.xy = (sw, sh), dims.zw = (dw, dh)
+cbuffer TPSParams : register(b0)
+{
+    float a0x, axx, ayx;   // tx affine: a0 + ax*x + ay*y
+    float a0y, axy, ayy;   // ty affine
+    float4 dims;
+    int   nCtrl;
+    int   clampEdge;       // 0 or 1
+    float pad0, pad1;
+};
+
+static const float PI = 3.14159265359;
+float U(float r) { return (r <= 1e-12) ? 0.0 : (r*r*log(r)); }
+float sinc(float t) { return (abs(t) < 1e-8) ? 1.0 : sin(PI*t)/(PI*t); }
+float lanczos(float r, float a) { return sinc(r) * sinc(r/a); }
+
+float tpsEval(float2 p, StructuredBuffer<float> X, StructuredBuffer<float> Y, StructuredBuffer<float> W,
+              float a0, float ax, float ay)
+{
+    float s = a0 + ax * p.x + ay * p.y;
+    [loop]
+    for (int i = 0; i < nCtrl; i++) {
+        float dx = p.x - X[i];
+        float dy = p.y - Y[i];
+        float r = sqrt(dx*dx + dy*dy);
+        s += W[i] * U(r);
+    }
+    return s;
+}
+
+
+
+
+[numthreads(8, 8, 1)]
+void WarpTest(uint3 id : SV_DispatchThreadID)
+{
+    int dw = (int) dims.z;
+    int dh = (int) dims.w;
+    float2 dstPix = float2(id.x + 0.5, id.y + 0.5);
+    float2 dstN = dstPix / float2(dw, dh); // normalized [0,1]
+    float sxN = tpsEval(dstN, _TxX, _TxY, _TxW, a0x, axx, ayx);
+    float syN = tpsEval(dstN, _TyX, _TyY, _TyW, a0y, axy, ayy);
+    _Dst[id.xy] = float4(sxN, syN, 0, 1);
+}
+
+[numthreads(8,8,1)]
+void WarpLanc (uint3 id : SV_DispatchThreadID)
+{
+    int dw = (int)dims.z;
+    int dh = (int)dims.w;
+    if (id.x >= (uint)dw || id.y >= (uint)dh) return;
+
+    float2 dstPix = float2(id.x + 0.5, id.y + 0.5);
+    float2 dstN   = dstPix / float2(dw, dh);        // normalized [0,1]
+
+    // TPS maps dstN -> srcN
+    float sxN = tpsEval(dstN, _TxX, _TxY, _TxW, a0x, axx, ayx);
+    float syN = tpsEval(dstN, _TyX, _TyY, _TyW, a0y, axy, ayy);
+
+    float2 srcPix = float2(sxN * dims.x, syN * dims.y) - 0.5;
+
+    // Radial Lanczos-3 over integer offsets in [-3, 3]
+    const float a = 3.0;
+    float3 sumRGB = 0;
+    float sumA = 0;
+    float sumW = 0;
+
+    // Centered pixel footprint
+    [loop]
+    for (int j = -3; j <= 3; j++) {
+        [loop]
+        for (int i = -3; i <= 3; i++) {
+            float2 s = float2(floor(srcPix.x) + 0.5 + i, floor(srcPix.y) + 0.5 + j);
+            float2 d = s - srcPix;
+            float  r = length(d);
+            if (r >= a) continue;
+
+            float w = lanczos(r, a);
+
+            float2 uv = (s + 0.5) / float2(dims.x, dims.y); // back to texcoords
+
+            float4 c;
+            if (clampEdge == 1) {
+                // clamp sample coordinates
+                float2 cuv = saturate(uv);
+                c = _Src.SampleLevel(sampler_LinearClamp, cuv, 0);
+            } else {
+                // border mode: if outside, skip (weight not added)
+                if (any(uv < 0) || any(uv > 1)) continue;
+                c = _Src.SampleLevel(sampler_LinearClamp, uv, 0);
+            }
+
+            sumRGB += w * c.rgb * c.a;
+            sumA += w * c.a;
+            sumW += w;
+        }
+    }
+
+    float3 outRGB = (sumA > 1e-8) ? (sumRGB / sumA) : 0;
+    float outA = (sumW > 1e-8) ? (sumA / sumW) : 0;
+    _Dst[id.xy] = float4(outRGB, outA);
+}
