@@ -10,19 +10,16 @@ namespace FisheyeFriend {
     public class IO : MonoBehaviour {
 
 
-        // Assign in the Inspector: Button for opening file dialog
         public Button openImageButton; // "Open Image" button
 
-        // Assign in the Inspector: Button for saving the original image
         public Button saveImageButton; // "Save" button
 
-        // Assign in the Inspector: RawImage for displaying the resized image (left)
+        public Button saveSharpImageButton; // "Save sharp (slow)" button
+
         public RawImage originalImage; // Left RawImage
 
-        // Assign in the Inspector: RawImage for displaying the resized image (right)
         public RawImage processedImage; // Right RawImage
 
-        // Assign in the Inspector: ScrollRect containing both images
         public ScrollRect scrollRect; // ScrollRect for side-by-side images
 
         // Store the original loaded image
@@ -31,7 +28,7 @@ namespace FisheyeFriend {
         // Store the resized image
         private Texture2D resizedTexture;
 
-
+        private Vector2 screenSize;
 
         public GpuWarpUnity gpuWarp;
 
@@ -40,20 +37,38 @@ namespace FisheyeFriend {
             openImageButton.onClick.AddListener(OnOpenImageClicked);
             saveImageButton.onClick.AddListener(OnSaveImageClicked);
             saveImageButton.interactable = false; // Disable until an image is loaded
+            saveSharpImageButton.onClick.AddListener(OnSaveSharpImageClicked);
+            saveSharpImageButton.interactable = false; // Disable until an image is loaded
+            screenSize = new Vector2(Screen.width, Screen.height);
+            PositionButtons();
 
-            Vector3 leftEdge = Camera.main.ScreenToWorldPoint(new Vector3(0, Screen.height, openImageButton.transform.position.z));
-            Vector3 topEdge = Camera.main.ScreenToWorldPoint(new Vector3(Screen.width, 0, openImageButton.transform.position.z));
+        }
 
-           // openImageButton.transform.position = new Vector3(leftEdge.x + openImageButton.GetComponent<RectTransform>().rect.width / 2, topEdge.y - openImageButton.GetComponent<RectTransform>().rect.height / 2, openImageButton.transform.position.z);
+        void PositionButtons () {
+            Vector2 layoutCurr = new Vector2(-Screen.width/2, Screen.height/2);
+            RectTransform currRect = openImageButton.GetComponent<RectTransform>();
+            currRect.anchoredPosition = new Vector3(layoutCurr.x+ currRect.rect.width / 2, layoutCurr.y - currRect.rect.height / 2, openImageButton.transform.position.z);
+            layoutCurr = new Vector2(currRect.anchoredPosition.x, Screen.height / 2);
+            currRect = saveImageButton.GetComponent<RectTransform>();
+            currRect.anchoredPosition = new Vector3(layoutCurr.x + currRect.rect.width, layoutCurr.y - currRect.rect.height / 2, saveImageButton.transform.position.z);
+            layoutCurr = new Vector2(currRect.anchoredPosition.x, Screen.height / 2);
+            currRect = saveSharpImageButton.GetComponent<RectTransform>();
+            currRect.anchoredPosition = new Vector3(layoutCurr.x + currRect.rect.width, layoutCurr.y - currRect.rect.height / 2, saveSharpImageButton.transform.position.z);
+
         }
 
         void Update () {
+
+            if (Screen.width != screenSize.x || Screen.height != screenSize.y) {
+                PositionButtons();
+            }
            if(Input.GetKeyDown(KeyCode.Tab)) {
                 SwapImages();
             }
            if (Input.GetKeyDown(KeyCode.Escape)) {
                 Application.Quit();
             }
+
 
            if(Input.GetKey(KeyCode.W)) {
                 originalImage.transform.position -= new Vector3(0, 1* originalImage.transform.localScale.y, 0);
@@ -74,8 +89,27 @@ namespace FisheyeFriend {
             }
 
             if (Input.mouseScrollDelta.y != 0f) {
-                originalImage.transform.localScale += new Vector3(Input.mouseScrollDelta.y, Input.mouseScrollDelta.y, 0);
-                processedImage.transform.localScale += new Vector3(Input.mouseScrollDelta.y, Input.mouseScrollDelta.y, 0);
+                float newScale = originalImage.transform.localScale.y+Input.mouseScrollDelta.y;
+                if(newScale >0) {
+                    originalImage.transform.localScale = new Vector3(newScale, newScale, 1);
+                    processedImage.transform.localScale = new Vector3(newScale, newScale, 1);
+                }
+            }
+
+            if (Input.GetKey(KeyCode.Minus)) {
+                float newScale = originalImage.transform.localScale.y - originalImage.transform.localScale.y / 20f;
+                if (newScale > 0) {
+                    originalImage.transform.localScale = new Vector3(newScale, newScale, 1);
+                    processedImage.transform.localScale = new Vector3(newScale, newScale, 1);
+                }
+            }
+
+            if (Input.GetKey(KeyCode.Equals)) {
+                float newScale = originalImage.transform.localScale.y + originalImage.transform.localScale.y / 20f;
+                if (newScale > 0) {
+                    originalImage.transform.localScale = new Vector3(newScale, newScale, 1);
+                    processedImage.transform.localScale = new Vector3(newScale, newScale, 1);
+                }
             }
         }
 
@@ -92,10 +126,7 @@ namespace FisheyeFriend {
         }
 
         void OnOpenImageClicked () {
-            Debug.Log("Open Image button clicked.");
-            // Use a file picker plugin or a custom file dialog for Unity.
-            // For demonstration, this is a placeholder path.
-            string path = ShowFilePicker(); // Implement this with a plugin or native dialog
+            string path = ShowFilePicker();
 
             if (!string.IsNullOrEmpty(path) && File.Exists(path)) {
                 //byte[] fileData = File.ReadAllBytes(path);
@@ -120,13 +151,36 @@ namespace FisheyeFriend {
 
                 // Enable the save button
                 saveImageButton.interactable = true;
+                saveSharpImageButton.interactable = true;
                 SwapImages();
              //   }
             }
         }
 
         void OnSaveImageClicked () {
-            TextureToBitmap((Texture2D)processedImage.texture).Save("D:\\tmp\\wallUnityGPULancSave.png", ImageFormat.Png);
+            string path = GetSavePath();
+            if (!string.IsNullOrEmpty(path)) {
+                TextureToBitmap((Texture2D)processedImage.texture).Save(path, ImageFormat.Png);
+            }
+        }
+
+        string GetSavePath () {
+            string path = ShowSavePicker();
+            if (!string.IsNullOrEmpty(path)) {
+                if (path.EndsWith(".png") == false) {
+                    path += ".png";
+                }
+            }
+            return path;
+        }
+
+        void OnSaveSharpImageClicked () {
+            string path = GetSavePath();
+            if (!string.IsNullOrEmpty(path)) {
+                
+                Bitmap sharpBM = new MapWarper().WarpImage(TextureToBitmap((Texture2D)originalImage.texture));
+                sharpBM.Save(path, ImageFormat.Png);
+            }
         }
 
         public Bitmap TextureToBitmap(Texture2D texture) {
@@ -199,6 +253,10 @@ namespace FisheyeFriend {
             return paths[0];
         }
 
+        string ShowSavePicker () {
+            var path = StandaloneFileBrowser.SaveFilePanel("Save File", "", "", "");
+            return path;
+        }
 
 
 

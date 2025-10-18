@@ -37,7 +37,7 @@ namespace FisheyeFriend {
                  else if (s.StartsWith("--outH=")) outHArg = int.Parse(s.Substring(7));
                  else if (s == "--clampEdge") clampEdge = true;
              }*/
-
+            throw new Exception("Deprecated: Use WarpImage(image) instead.");
             Mapping map = Mapping.Read(config.mapPath);
 
             using Bitmap src = new Bitmap(config.srcPath);
@@ -50,8 +50,8 @@ namespace FisheyeFriend {
 
             Debug.Log($"Rendering {outW}x{outH} with radial Lanczos-3" + (config.clampEdge ? ", clampEdge" : ""));
             using Bitmap dst = new Bitmap(outW, outH, PixelFormat.Format32bppArgb);
-            
-            
+
+
             //Renderer.RenderLanczos3Radial(src, dst, tps, config.clampEdge);
 
             Renderer renderer = new Renderer(src, dst, tps, config.clampEdge);
@@ -60,6 +60,19 @@ namespace FisheyeFriend {
             dst.Save(config.outPath, ImageFormat.Png);
             Debug.Log($"Wrote {config.outPath}");
         }
+
+        public Bitmap WarpImage (Bitmap src) {
+            // Mapping map = Mapping.Read("hemi_pairs_596.json");
+            Mapping map = Mapping.Read(((TextAsset)Resources.Load("hemi_pairs_596")).text);
+            int sw = src.Width, sh = src.Height;
+            int outW = sw;
+            int outH = sh;
+            TPS2D tps = TPS2D.FitInverseNormalized(map, 1e-5);
+            Bitmap dst = new Bitmap(outW, outH, PixelFormat.Format32bppArgb);
+            Renderer renderer = new Renderer(src, dst, tps, true);
+            renderer.Render();
+            return dst;
+        }
     }
 
     public class WarpConfig {
@@ -67,7 +80,7 @@ namespace FisheyeFriend {
         public string srcPath;
         public string outPath;
 
-        public double lambda = 1e-5;
+        public double lambda = 1e-5; //TODO: Make configurable
         public int? outWArg = null, outHArg = null;
         public bool clampEdge = false;
     }
@@ -80,8 +93,8 @@ namespace FisheyeFriend {
             public double sxN, syN, dxN, dyN;
         }
 
-        public static Mapping Read (string path) {
-            string text = File.ReadAllText(path);
+        public static Mapping Read (string text) {
+           // string text = File.ReadAllText(path);
             Mapping m = new();
 
             m.sW = ReadInt(text, "\"source\"\\s*:\\s*\\{[^}]*?\"width\"\\s*:\\s*(\\d+)");

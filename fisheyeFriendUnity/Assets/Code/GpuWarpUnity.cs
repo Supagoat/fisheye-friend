@@ -28,10 +28,10 @@ namespace FisheyeFriend {
             //_kernel = _cs.FindKernel("Warp");
 
             WarpConfig config = new WarpConfig();
-            config.mapPath = "D:\\tmp\\hemi_pairs_596.json";
+            //config.mapPath = "D:\\tmp\\hemi_pairs_596.json";
             // config.srcPath = "D:\\tmp\\wallFish.jpg";
             // config.outPath = "D:\\tmp\\wallLanc1GPUUnityOut.png";
-            Mapping map = Mapping.Read(config.mapPath);
+            Mapping map = Mapping.Read(((TextAsset)Resources.Load("hemi_pairs_596")).text);
             tps = TPS2D.FitInverseNormalized(map, config.lambda);
 
             // using Bitmap src = new Bitmap(config.srcPath);
