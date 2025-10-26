@@ -4,11 +4,13 @@ using UnityEngine.UI;
 using UnityEngine.EventSystems;
 using System.Drawing;
 using System.Drawing.Imaging;
+using TMPro;
 using SFB;
 
 namespace FisheyeFriend {
     public class IO : MonoBehaviour {
 
+        public TextMeshProUGUI statusText;
 
         public Button openImageButton; // "Open Image" button
 
@@ -17,6 +19,9 @@ namespace FisheyeFriend {
         public Button saveSharpImageButton; // "Save sharp (slow)" button
 
         public RawImage originalImage; // Left RawImage
+        private Bitmap source; 
+        private string sourcePath;
+        private int processRequestFrameNum = -1;
 
         public RawImage processedImage; // Right RawImage
 
@@ -33,6 +38,8 @@ namespace FisheyeFriend {
         public GpuWarpUnity gpuWarp;
 
 
+
+
         void Start () {
             openImageButton.onClick.AddListener(OnOpenImageClicked);
             saveImageButton.onClick.AddListener(OnSaveImageClicked);
@@ -42,10 +49,14 @@ namespace FisheyeFriend {
             screenSize = new Vector2(Screen.width, Screen.height);
             PositionButtons();
 
+            statusText.text = "Help text goes here";
+            statusText.gameObject.SetActive(true);
+
         }
 
         void PositionButtons () {
             Vector2 layoutCurr = new Vector2(-Screen.width/2, Screen.height/2);
+            statusText.GetComponent<RectTransform>().anchoredPosition = new Vector3(0, 0,statusText.transform.position.z);
             RectTransform currRect = openImageButton.GetComponent<RectTransform>();
             currRect.anchoredPosition = new Vector3(layoutCurr.x+ currRect.rect.width / 2, layoutCurr.y - currRect.rect.height / 2, openImageButton.transform.position.z);
             layoutCurr = new Vector2(currRect.anchoredPosition.x, Screen.height / 2);
@@ -54,7 +65,7 @@ namespace FisheyeFriend {
             layoutCurr = new Vector2(currRect.anchoredPosition.x, Screen.height / 2);
             currRect = saveSharpImageButton.GetComponent<RectTransform>();
             currRect.anchoredPosition = new Vector3(layoutCurr.x + currRect.rect.width, layoutCurr.y - currRect.rect.height / 2, saveSharpImageButton.transform.position.z);
-
+            
         }
 
         void Update () {
@@ -111,6 +122,11 @@ namespace FisheyeFriend {
                     processedImage.transform.localScale = new Vector3(newScale, newScale, 1);
                 }
             }
+
+            if(processRequestFrameNum > 0 && Time.frameCount - processRequestFrameNum > 2) {
+                processRequestFrameNum = -1;
+                Process();
+            }
         }
 
         void SwapImages () {
@@ -125,35 +141,48 @@ namespace FisheyeFriend {
             }
         }
 
+        void Process() {
+            source = new Bitmap(sourcePath);
+            Texture2D tex = BitmapToTexture2D(source);
+            originalImage.texture = tex;
+            Texture2D wrarped = gpuWarp.WarpImage(source);
+
+            processedImage.texture = wrarped;
+
+            // Enable the save button
+            saveImageButton.interactable = true;
+            saveSharpImageButton.interactable = true;
+            SwapImages();
+            statusText.gameObject.SetActive(false);
+        }
+
         void OnOpenImageClicked () {
             string path = ShowFilePicker();
 
             if (!string.IsNullOrEmpty(path) && File.Exists(path)) {
                 //byte[] fileData = File.ReadAllBytes(path);
                 //  originalTexture = new Texture2D(2, 2);
+                statusText.text = "Loading/Defishing";
+                statusText.gameObject.SetActive(true);
+                sourcePath = path;
+     
 
-                Bitmap source = new Bitmap(path); // your loaded Bitmap
-                Texture2D tex = BitmapToTexture2D(source);
-                originalImage.texture = tex;
 
+                processRequestFrameNum = Time.frameCount;
                 //  if (originalTexture.LoadImage(fileData)) {
 
                 //   byte[] sourceBytes = ((Texture2D)originalTexture.texture).EncodeToPNG();
 
-                Texture2D wrarped = gpuWarp.WarpImage(source);
-                   /* Bitmap warpedBM;
-                    using (var warpMS = new MemoryStream(wrarped.EncodeToPNG())) {
-                        warpedBM = new Bitmap(warpMS);
-                    }
-                    warpedBM.Save("D:\\tmp\\wallUnityGPULanc.png", ImageFormat.Png);
-                   */
-                    processedImage.texture = wrarped;
 
-                // Enable the save button
-                saveImageButton.interactable = true;
-                saveSharpImageButton.interactable = true;
-                SwapImages();
-             //   }
+                /* Bitmap warpedBM;
+                 using (var warpMS = new MemoryStream(wrarped.EncodeToPNG())) {
+                     warpedBM = new Bitmap(warpMS);
+                 }
+                 warpedBM.Save("D:\\tmp\\wallUnityGPULanc.png", ImageFormat.Png);
+                */
+
+
+                //   }
             }
         }
 
@@ -177,9 +206,12 @@ namespace FisheyeFriend {
         void OnSaveSharpImageClicked () {
             string path = GetSavePath();
             if (!string.IsNullOrEmpty(path)) {
-                
+                statusText.text = "Defishing (Slow - can take a couple minutes)";
+                statusText.gameObject.SetActive(true);
                 Bitmap sharpBM = new MapWarper().WarpImage(TextureToBitmap((Texture2D)originalImage.texture));
+                //Bitmap sharpBM = new MapWarper().WarpImageAsync(TextureToBitmap((Texture2D)originalImage.texture));
                 sharpBM.Save(path, ImageFormat.Png);
+                statusText.gameObject.SetActive(false);
             }
         }
 

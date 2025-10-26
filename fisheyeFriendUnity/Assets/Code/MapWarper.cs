@@ -61,6 +61,15 @@ namespace FisheyeFriend {
             Debug.Log($"Wrote {config.outPath}");
         }
 
+        /* TODO: Complete this for the CPU async version
+        public async Task<Bitmap> WarpImageAsync(Bitmap src) {
+            Bitmap fromNonAsync =  WarpImage(src);
+           // using (Graphics g = Graphics.FromImage(dst)) {
+           //     g.DrawImage(fromNonAsync, 0, 0, dst.Width, dst.Height);
+           // }
+
+        }
+        */
         public Bitmap WarpImage (Bitmap src) {
             // Mapping map = Mapping.Read("hemi_pairs_596.json");
             Mapping map = Mapping.Read(((TextAsset)Resources.Load("hemi_pairs_596")).text);
@@ -260,7 +269,7 @@ namespace FisheyeFriend {
         }
 
         public static ThinPlateSpline Fit (double[] xi, double[] yi, double[] zi, double lambda) {
-            long t = DateTime.Now.Millisecond;
+            DateTime t = DateTime.Now;
             int n = xi.Length, dim = n + 3;
             double[,] A = new double[dim, dim];
             double[] b = new double[dim];
@@ -283,7 +292,7 @@ namespace FisheyeFriend {
             double[] sol = Solve(A, b);
             double[] w = new double[n];
             Array.Copy(sol, w, n);
-            Debug.Log("TPS fit time: " + (DateTime.Now.Millisecond - t) + " ms");
+          //  Debug.Log("TPS fit time: " + (DateTime.Now - t) + " ms");
             return new ThinPlateSpline((double[])xi.Clone(), (double[])yi.Clone(), w, sol[n], sol[n + 1], sol[n + 2]);
         }
 
