@@ -37,6 +37,7 @@ namespace FisheyeFriend {
 
         public GpuWarpUnity gpuWarp;
 
+        private MapWarper sharpRenderer;
 
 
 
@@ -49,7 +50,7 @@ namespace FisheyeFriend {
             screenSize = new Vector2(Screen.width, Screen.height);
             PositionButtons();
 
-            statusText.text = "Help text goes here";
+            statusText.text = "Load image to defish (GPU).  Use WASD and =/- to navigate. Tab to switch between original and defished.  Sharp defish is CPU-based and will prompt to save the image when complete.";
             statusText.gameObject.SetActive(true);
 
         }
@@ -126,6 +127,12 @@ namespace FisheyeFriend {
             if(processRequestFrameNum > 0 && Time.frameCount - processRequestFrameNum > 2) {
                 processRequestFrameNum = -1;
                 Process();
+            }
+
+            if (sharpRenderer != null) {
+                if(sharpRenderer.RenderIsComplete()) {
+                    OnSharpRenderComplete();
+                }
             }
         }
 
@@ -204,15 +211,30 @@ namespace FisheyeFriend {
         }
 
         void OnSaveSharpImageClicked () {
-            string path = GetSavePath();
-            if (!string.IsNullOrEmpty(path)) {
+            
+
                 statusText.text = "Defishing (Slow - can take a couple minutes)";
                 statusText.gameObject.SetActive(true);
-                Bitmap sharpBM = new MapWarper().WarpImage(TextureToBitmap((Texture2D)originalImage.texture));
-                //Bitmap sharpBM = new MapWarper().WarpImageAsync(TextureToBitmap((Texture2D)originalImage.texture));
-                sharpBM.Save(path, ImageFormat.Png);
-                statusText.gameObject.SetActive(false);
+                sharpRenderer = new MapWarper();
+                sharpRenderer.WarpImage(TextureToBitmap((Texture2D)originalImage.texture));
+                statusText.text = "Performing sharp defishing (slow)";
+                statusText.gameObject.SetActive(true);
+                
+            
+        }
+
+        private void OnSharpRenderComplete() {
+            //Bitmap sharpBM = new MapWarper().WarpImageAsync(TextureToBitmap((Texture2D)originalImage.texture));
+            Debug.Log("HEEEEEEEEEEEEEEE");
+            string path = GetSavePath();
+            if (!string.IsNullOrEmpty(path)) {
+                Debug.Log("Saving to " + path);
+                sharpRenderer.output.Save(path, ImageFormat.Png);
             }
+            sharpRenderer = null;
+            
+            statusText.gameObject.SetActive(false);
+
         }
 
         public Bitmap TextureToBitmap(Texture2D texture) {

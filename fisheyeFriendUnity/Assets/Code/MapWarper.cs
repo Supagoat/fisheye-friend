@@ -12,6 +12,9 @@ using FisheyeFriend;
 
 namespace FisheyeFriend {
     public class MapWarper {
+        
+        public Bitmap output;
+        Renderer renderer;
         static void Main (string[] args) {
             if (args.Length < 3) {
                 Console.WriteLine("Usage: MapDefish <mapping.json> <sourceImage> <output.png> [--lambda=1e-5] [--outW=W --outH=H] [--clampEdge]");
@@ -26,6 +29,10 @@ namespace FisheyeFriend {
             int? outWArg = null, outHArg = null;
             bool clampEdge = false;
             */
+        }
+
+        public bool IsRenderComplete () {
+            return renderer.renderComplete;
         }
 
         public void WarpImage (WarpConfig config) {
@@ -55,34 +62,38 @@ namespace FisheyeFriend {
             //Renderer.RenderLanczos3Radial(src, dst, tps, config.clampEdge);
 
             Renderer renderer = new Renderer(src, dst, tps, config.clampEdge);
-            renderer.Render();
-
-            dst.Save(config.outPath, ImageFormat.Png);
-            Debug.Log($"Wrote {config.outPath}");
+            renderer.BeginRender();
+            Debug.Log("No longer supported path to warp");
+            //dst.Save(config.outPath, ImageFormat.Png);
+            //Debug.Log($"Wrote {config.outPath}");
         }
 
-        /* TODO: Complete this for the CPU async version
+        /*
         public async Task<Bitmap> WarpImageAsync(Bitmap src) {
             Bitmap fromNonAsync =  WarpImage(src);
            // using (Graphics g = Graphics.FromImage(dst)) {
            //     g.DrawImage(fromNonAsync, 0, 0, dst.Width, dst.Height);
            // }
 
-        }
-        */
-        public Bitmap WarpImage (Bitmap src) {
+        }*/
+        
+        public void WarpImage (Bitmap src) {
             // Mapping map = Mapping.Read("hemi_pairs_596.json");
             Mapping map = Mapping.Read(((TextAsset)Resources.Load("hemi_pairs_596")).text);
             int sw = src.Width, sh = src.Height;
             int outW = sw;
             int outH = sh;
             TPS2D tps = TPS2D.FitInverseNormalized(map, 1e-5);
-            Bitmap dst = new Bitmap(outW, outH, PixelFormat.Format32bppArgb);
-            Renderer renderer = new Renderer(src, dst, tps, true);
-            renderer.Render();
-            return dst;
+            output = new Bitmap(outW, outH, PixelFormat.Format32bppArgb);
+            renderer = new Renderer(src, output, tps, true);
+            renderer.BeginRender();
+        }
+        public bool RenderIsComplete () {
+            return renderer.CheckCompletion();
         }
     }
+
+
 
     public class WarpConfig {
         public string mapPath;
@@ -473,7 +484,6 @@ namespace FisheyeFriend {
             int dw = dstData.Width, dh = dstData.Height;
 
             long t = DateTime.Now.Millisecond;
-            Debug.Log("Beginning render");
 
 
             unsafe {
@@ -546,7 +556,7 @@ namespace FisheyeFriend {
                     }
                 }
             }
-            Debug.Log("lancLoop time: " + (DateTime.Now.Millisecond - t) + " ms");
+
 
         }
 
@@ -561,7 +571,7 @@ namespace FisheyeFriend {
                 double a = 3.0;
                 double[] map = new double[2];
 
-                Debug.Log($"Thread {startX},{startY} starting render portion {startX}-{endX} x {startY}-{endY}");
+              //  Debug.Log($"Thread {startX},{startY} starting render portion {startX}-{endX} x {startY}-{endY}");
  
                 for (int y = startY; y < endY; y++) {
                     int row = y * endX;
@@ -580,7 +590,7 @@ namespace FisheyeFriend {
                         double W = 0, Aa = 0, Ar = 0, Ag = 0, Ab = 0;
 
                         for (int yy = ymin; yy <= ymax; yy++) {
-                            Debug.Log($"Thread {startX},{startY} processing pixel {x},{y} sample line {yy}");
+                            //Debug.Log($"Thread {startX},{startY} processing pixel {x},{y} sample line {yy}");
                             for (int xx = xmin; xx <= xmax; xx++) {
                                 double dx = (xx + 0.5) - sx;
                                 double dy = (yy + 0.5) - sy;
@@ -636,9 +646,12 @@ namespace FisheyeFriend {
 class Renderer {
     private Bitmap src;
     private Bitmap dst;
+    private BitmapData srcData;
+    private BitmapData dstData;
     private TPS2D tps;
     private bool clampEdge;
-
+    ManualResetEvent[] waitOn;
+    public bool renderComplete = false;
 
     public Renderer (Bitmap src, Bitmap dst, TPS2D tps, bool clampEdge) {
         this.src = src;
@@ -647,14 +660,20 @@ class Renderer {
         this.clampEdge = clampEdge;
     }
 
+    //TODO: Split into as many portions as there is CPU.  Consider doing vertical or horizontal slices on each thread
+    public void BeginRender () {
 
-    public void Render () {
+        if(waitOn != null) {
+            Debug.Log("Attempting a render while one is in progress");
+            return;
+        }
+        renderComplete = false;
         int sw = src.Width, sh = src.Height;
         int dw = dst.Width, dh = dst.Height;
-        BitmapData srcData = src.LockBits(new Rectangle(0, 0, sw, sh), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-        BitmapData dstData = dst.LockBits(new Rectangle(0, 0, dw, dh), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-        Debug.Log("Beginning render");
-        ManualResetEvent[] waitOn = { new ManualResetEvent(false), new ManualResetEvent(false), new ManualResetEvent(false), new ManualResetEvent(false) };
+        srcData = src.LockBits(new Rectangle(0, 0, sw, sh), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        dstData = dst.LockBits(new Rectangle(0, 0, dw, dh), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+       
+        waitOn = new ManualResetEvent []{ new ManualResetEvent(false), new ManualResetEvent(false), new ManualResetEvent(false), new ManualResetEvent(false) };
         RenderActor[] actors = {
                 new RenderActor(0, 0, sw/2, sh/2, tps, clampEdge, srcData, dstData, waitOn[0]),
                 new RenderActor(0, sh/2, sw/2, sh, tps, clampEdge, srcData, dstData, waitOn[1]),
@@ -665,12 +684,26 @@ class Renderer {
           for (int i = 0; i < actors.Length; i++) {
                 ThreadPool.QueueUserWorkItem(actors[i].ThreadPoolCallback);
         }
-       // actors[0].RenderAPortion();
-        WaitHandle.WaitAll(waitOn);
-        Debug.Log("Render complete");
+      //  WaitHandle.WaitAll(waitOn);
+
+
+    }
+
+    public bool CheckCompletion() {
+        foreach(ManualResetEvent threadCheck in waitOn) {
+            if(!threadCheck.WaitOne(0)) {
+                return false;
+            }
+        }
+        OnRenderComplete();
+        return true;
+    }
+
+    void OnRenderComplete() {
         src.UnlockBits(srcData);
         dst.UnlockBits(dstData);
-
+        waitOn = null;
+        renderComplete = true;
     }
     /*
 
