@@ -1,0 +1,20 @@
+{
+    "projectionFile": "defish-hemi-596.json",
+    "projectionName": "Hemi",
+
+    "outputSize": "SameAsPhoto",
+    "edges": "Extend",
+
+    "lanczosLobes": 4,
+    "lightSpace": "Sigmoidal",
+    "antialias": false,
+    "apertureCorrection": true,
+
+    "defishOnOpen": true,
+
+    "defaultSaveFormat": "jpg",
+    "batchFileSuffix": "_defished",
+
+    "uiScale": 0,
+    "maxZoom": 64
+}
