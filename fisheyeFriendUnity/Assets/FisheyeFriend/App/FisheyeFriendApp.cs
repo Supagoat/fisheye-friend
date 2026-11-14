@@ -24,6 +24,8 @@ namespace FisheyeFriend.App
         public AppConfig Config { get; private set; }
         public DefishSettings Settings { get; private set; }
         internal Projection Projection { get; private set; }
+        /// <summary>Where defishing happens (GPU or CPU).</summary>
+        internal DefishEngine Engine { get; private set; }
 
         private readonly UiStyles _ui = new UiStyles();
         private SettingsPanel _panel;
@@ -82,7 +84,9 @@ namespace FisheyeFriend.App
             Config = AppConfig.Load(out warning);
             Settings = Prefs.LoadSettings(Config.CreateDefaultSettings());
             Projection = new Projection(Config);   // prepared on a worker thread
-            _panel = new SettingsPanel(Config, Defer, () => Prefs.SaveSettings(Settings));
+            Engine = new DefishEngine(Prefs.GetBool("UseGpu", Config.useGpu));
+            if (Engine.Unavailable != null) Debug.Log("[Fisheye Friend] Defishing on the CPU: " + Engine.Unavailable + ".");
+            _panel = new SettingsPanel(Config, Defer, () => Prefs.SaveSettings(Settings), Engine);
             _interactive = new InteractiveMode(this);
             _batch = new BatchMode(this);
             _mode = Prefs.GetString("Mode", "Interactive") == "Batch" ? Mode.Batch : Mode.Interactive;

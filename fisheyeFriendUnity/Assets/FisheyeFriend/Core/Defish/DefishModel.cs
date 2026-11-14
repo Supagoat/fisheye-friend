@@ -330,14 +330,16 @@ namespace FisheyeFriend.Core.Defish
 
         /// <summary>
         /// A shape curve's factor at distance <paramref name="rho"/> from the centre (0 = centre, 1 = corner of the
-        /// frame): a smooth monotone-preserving cubic (Fritsch-Carlson) through the points, flat beyond the corner.
+        /// frame): a smooth monotone-preserving cubic (Fritsch-Carlson) through the points. Past the corners (outside the
+        /// frame, where only the geometry's margin lies) it carries on in a straight line with the same slope, so the
+        /// geometry stays smooth there and its interpolation stays exact at the corners.
         /// </summary>
         public static double ShapeAt(double[] shape, double rho)
         {
             int n = shape.Length;
-            if (rho <= 0) return shape[0];
-            if (rho >= 1) return shape[n - 1];
             double h = 1.0 / (n - 1);
+            if (rho <= 0) return shape[0];
+            if (rho >= 1) return shape[n - 1] + Tangent(shape, n - 1, h) * (rho - 1);
             int k = Math.Min(n - 2, (int)(rho / h));
             double t = (rho - k * h) / h;
             double m0 = Tangent(shape, k, h), m1 = Tangent(shape, k + 1, h);

@@ -81,6 +81,37 @@ namespace FisheyeFriend.Core.Resampling
     {
         private const int LutSize = 16384;
 
+        // ---- for other implementations of this resampler (the GPU one): its tables and constants, exactly as used here
+
+        /// <summary>Entries in the kernel table (<see cref="WeightTable"/>).</summary>
+        public const int WeightTableSize = LutSize;
+        /// <summary>ln(scale) range of <see cref="ApertureTableValues"/>.</summary>
+        public const double ApertureLogMin = ApLogMin, ApertureLogMax = ApLogMax;
+
+        /// <summary>Sample value (0..255 or 0..65535) -> working light space, as the resampler decodes it.</summary>
+        public static float[] DecodeTable(int depth, LightSpace work)
+        {
+            return BuildDecodeLut(depth, work);
+        }
+
+        /// <summary>The separable kernel's weight at offsets 0..<paramref name="radius"/> (<see cref="WeightTableSize"/> entries).</summary>
+        public static float[] WeightTable(WarpKernel kernel, double radius)
+        {
+            return BuildWeightLut1D(kernel, radius);
+        }
+
+        /// <summary>The aperture coefficient at evenly spaced ln(scale) from <see cref="ApertureLogMin"/> to <see cref="ApertureLogMax"/>.</summary>
+        public static double[] ApertureTableValues()
+        {
+            return (double[])ApertureTable.Clone();
+        }
+
+        /// <summary>A gamma-encoded value (0..1) in the working light space (the background colour).</summary>
+        public static float WorkingValue(float gammaValue, LightSpace work)
+        {
+            return ToWorking(gammaValue, work);
+        }
+
         /// <summary>Squared footprint scale for a squared map scale <paramref name="sq"/>: at least 1, following the shrink by <paramref name="k"/>.</summary>
         private static double Widen(double sq, double k)
         {

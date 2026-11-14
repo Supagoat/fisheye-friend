@@ -276,7 +276,8 @@ namespace FisheyeFriend.App
                         var g = await _app.Projection.GeometryAsync(Defisher.SensorAspect(img), settings.Adjust);
                         _itemProgress.BeginStage("Defishing", 0.1f, 0.6f);
                         bool shape = Defisher.ShapeDiffers(g, img);
-                        var outImg = await Task.Run(() => Defisher.Process(img, g, settings, _itemProgress, ct), ct);
+                        var outcome = await _app.Engine.DefishAsync(img, g, settings, _itemProgress, ct);
+                        var outImg = outcome.Image;
                         img = null;
                         _itemProgress.BeginStage("Encoding", 0.7f, 0.3f);
                         var fmt = it.Format;
@@ -288,7 +289,8 @@ namespace FisheyeFriend.App
                             FileUtil.WriteAllBytesSafely(path, bytes);
                         }, ct);
                         it.Status = BatchItemStatus.Done;
-                        it.Message = outImg.Width + " x " + outImg.Height + (shape ? "   not 3:2 - stretched to the projection's frame" : "");
+                        it.Message = outImg.Width + " x " + outImg.Height + (outcome.OnGpu ? "   GPU" : "   CPU" + (outcome.Note != null ? " (" + outcome.Note + ")" : "")) +
+                                     (shape ? "   not 3:2 - stretched to the projection's frame" : "");
                         done++;
                     }
                     catch (OperationCanceledException)

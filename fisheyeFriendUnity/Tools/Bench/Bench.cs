@@ -9,6 +9,7 @@ using FisheyeFriend.Core.Codecs;
 using FisheyeFriend.Core.Color;
 using FisheyeFriend.Core.Imaging;
 using FisheyeFriend.Core.Resampling;
+using FisheyeFriend.Core.Testing;
 using System.Threading.Tasks;
 
 namespace FisheyeFriendBench
@@ -42,6 +43,8 @@ namespace FisheyeFriendBench
                     case "ff-replica": return ReplicaCmd(args);
                     case "defish": return DefishCmd(args);
                     case "model-defish": return ModelDefishCmd(args);
+                    case "conformance": return ConformanceCmd(args);
+                    case "gpu-emulate": return GpuEmulateCmd(args);
                     case "prof": return ProfCmd(args);
                     case "selftest": return SelfTest(args);
                     case "jac": return JacCmd(args);
@@ -288,6 +291,130 @@ namespace FisheyeFriendBench
             Console.WriteLine("defished " + src.Width + "x" + src.Height + " -> " + r2.Width + "x" + r2.Height + " (" + s + ") in " + sw.ElapsedMilliseconds + " ms");
             File.WriteAllBytes(a[3], PngCodec.Encode(r2));
             return 0;
+        }
+
+        // conformance <TestData dir> [write]: the CPU defish against the golden points and renders (write: make the renders)
+        private static int ConformanceCmd(string[] a)
+        {
+            _fails = 0;
+            string dir = a[1];
+            bool write = a.Length > 2 && a[2] == "write";
+            var model = DefishModel.Parse(File.ReadAllText(Path.Combine(dir, "../../Assets/StreamingAssets/defish-hemi-model.json")));
+            var cases = Conformance.LoadGolden(File.ReadAllText(Path.Combine(dir, "defish-golden.json")));
+            double worstExact = 0, worstGrid = 0;
+            foreach (var c in cases)
+            {
+                var mm = new DefishModelMap(model, c.Adjustment, c.Aspect);
+                var exact = Conformance.CompareMapping(c, (u, v) =>
+                {
+                    double s, t;
+                    mm.Reset();
+                    mm.Map(u, v, out s, out t);
+                    return new[] { s, t };
+                });
+                var g = DefishGeometry.FromModel(model, c.Adjustment, c.Aspect);
+                var grid = Conformance.CompareMapping(c, (u, v) =>
+                {
+                    double s, t, q0, q1, q2, q3;
+                    g.Map(u, v, out s, out t, out q0, out q1, out q2, out q3);
+                    return new[] { s, t };
+                });
+                Console.WriteLine("  " + c.Name.PadRight(32) + " exact: " + exact.MaxPx.ToString("0.0e0") + " px   grid: " + grid);
+                worstExact = Math.Max(worstExact, exact.MaxPx);
+                worstGrid = Math.Max(worstGrid, grid.MaxPx);
+            }
+            Check(worstExact < 1e-4, "CPU model vs golden points (" + cases.Count + " cases): max " + worstExact.ToString("0.0e0") + " px on an " + Conformance.ReferenceWidth + " px frame");
+            Check(worstGrid < 0.002, "CPU grid vs golden points: max " + worstGrid.ToString("0.00000") + " px");
+
+            foreach (var rc in Conformance.RenderCases)
+            {
+                var img = rc.MakeImage();
+                var g = DefishGeometry.FromModel(model, rc.Settings.Adjust, rc.SensorAspect);
+                var r = Defisher.Process(img, g, rc.Settings);
+                string path = Path.Combine(dir, rc.GoldenFile);
+                if (write)
+                {
+                    File.WriteAllBytes(path, PngCodec.Encode(r));
+                    Console.WriteLine("  wrote " + rc.GoldenFile + " " + r.Width + "x" + r.Height);
+                    continue;
+                }
+                var gold = PngCodec.Decode(File.ReadAllBytes(path));
+                var d = Conformance.Compare(r, gold);
+                Check(d.SameLayout && d.Max == 0, "CPU render " + rc.Id + " vs golden: " + d);
+            }
+            if (rc_none_check(model) == false) { }
+            Console.WriteLine(_fails == 0 ? "ALL PASSED" : _fails + " FAILED");
+            return _fails == 0 ? 0 : 1;
+        }
+
+        // gpu-emulate <TestData dir>: the GPU kernels, emulated in 32-bit floats, against the golden points and the CPU defish
+        private static int GpuEmulateCmd(string[] a)
+        {
+            _fails = 0;
+            string dir = a[1];
+            var model = DefishModel.Parse(File.ReadAllText(Path.Combine(dir, "../../Assets/StreamingAssets/defish-hemi-model.json")));
+            var cases = Conformance.LoadGolden(File.ReadAllText(Path.Combine(dir, "defish-golden.json")));
+            double worstPts = 0, worstNodes = 0;
+            foreach (var c in cases)
+            {
+                var e = new GpuEmulator(FisheyeFriend.Core.Gpu.GpuPlan.ModelParams.For(model, c.Adjustment, c.Aspect));
+                var pts = Conformance.CompareMapping(c, (u, v) =>
+                {
+                    float s, t;
+                    e.MapPoint((float)u, (float)v, out s, out t);
+                    return new double[] { s, t };
+                });
+                var ge = GpuEmulator.Geometry(model, c.Adjustment, c.Aspect);
+                var gc = DefishGeometry.FromModel(model, c.Adjustment, c.Aspect);
+                double nd = 0;
+                for (int k = 0; k < gc.GridNodes; k++)
+                {
+                    float s1, t1, s2, t2;
+                    ge.Node(k, out s1, out t1);
+                    gc.Node(k, out s2, out t2);
+                    nd = Math.Max(nd, Math.Max(Math.Abs(s1 - s2), Math.Abs(t1 - t2) * c.Aspect) * Conformance.ReferenceWidth);
+                }
+                Console.WriteLine("  " + c.Name.PadRight(32) + " points: " + pts + "   nodes vs CPU: max " + nd.ToString("0.00000") + " px");
+                worstPts = Math.Max(worstPts, pts.MaxPx);
+                worstNodes = Math.Max(worstNodes, nd);
+            }
+            Check(worstPts < 0.01, "emulated GPU model vs golden points: max " + worstPts.ToString("0.00000") + " px on an " + Conformance.ReferenceWidth + " px frame");
+            Check(worstNodes < 0.01, "emulated GPU grid vs CPU grid: max " + worstNodes.ToString("0.00000") + " px");
+
+            foreach (var rc in Conformance.RenderCases)
+            {
+                var img = rc.MakeImage();
+                var gc = DefishGeometry.FromModel(model, rc.Settings.Adjust, rc.SensorAspect);
+                var cpu = Defisher.Process(img, gc, rc.Settings);
+                var warp = GpuEmulator.Defish(img, gc, rc.Settings);
+                var dw = Conformance.Compare(warp, cpu);
+                Console.WriteLine("  " + rc.Id.PadRight(28) + " warp only (same grid): " + dw);
+                var ge = GpuEmulator.Geometry(model, rc.Settings.Adjust, rc.SensorAspect);
+                var full = GpuEmulator.Defish(img, ge, rc.Settings);
+                var df = Conformance.Compare(full, cpu);
+                Console.WriteLine("  " + "".PadRight(28) + " whole defish:          " + df);
+                double need = rc.Depth == 8 ? 0.999 : 0.99;
+                bool exactCase = rc.Id == "rgb8-none";
+                Check(dw.SameLayout && dw.Max <= (exactCase ? 0 : 1) && dw.IdenticalFraction >= (exactCase ? 1 : need),
+                    rc.Id + ": emulated GPU resampling matches the CPU (same geometry): max " + dw.Max + ", " + (dw.IdenticalFraction * 100).ToString("0.000") + "% identical");
+            }
+            Console.WriteLine(_fails == 0 ? "ALL PASSED" : _fails + " FAILED");
+            return _fails == 0 ? 0 : 1;
+        }
+
+        private static bool rc_none_check(DefishModel model)
+        {
+            // with no correction the result is the photo itself, exactly
+            foreach (var rc in Conformance.RenderCases)
+            {
+                if (rc.Id != "rgb8-none") continue;
+                var img = rc.MakeImage();
+                var r = Defisher.Process(img, DefishGeometry.FromModel(model, rc.Settings.Adjust, rc.SensorAspect), rc.Settings);
+                var d = Conformance.Compare(r, img);
+                Check(d.SameLayout && d.Max == 0, "no correction gives the photo back: " + d);
+                return d.Max == 0;
+            }
+            return true;
         }
 
         // model-defish <photo.png> <out.png> [strength=1] [h=1] [v=1] [shapex=a,b,c,d] [shapey=a,b,c,d] [preview=W] [full] [crop]:

@@ -1,7 +1,10 @@
 {
     "name": "FisheyeFriend.Editor",
     "rootNamespace": "FisheyeFriend.EditorTools",
-    "references": [],
+    "references": [
+        "FisheyeFriend.Core",
+        "FisheyeFriend.Gpu"
+    ],
     "includePlatforms": [
         "Editor"
     ],

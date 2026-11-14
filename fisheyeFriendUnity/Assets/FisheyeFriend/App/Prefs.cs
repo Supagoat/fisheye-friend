@@ -17,7 +17,7 @@ namespace FisheyeFriend.App
         public static readonly string[] Keys =
         {
             "OutputSize", "Edges", "Kernel", "Radius", "Light", "Antialias", "Aperture", "DefishOnOpen",
-            "Strength", "AmountX", "AmountY", "ShapeX", "ShapeY", "DefishLinked",
+            "Strength", "AmountX", "AmountY", "ShapeX", "ShapeY", "DefishLinked", "UseGpu",
             "SaveFormat", "OpenDir", "SaveDir", "Mode", "BatchIn", "BatchOut", "BatchSubfolders", "BatchOverwrite", "BatchSuffix", "SettingsVersion",
         };
 

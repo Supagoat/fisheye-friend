@@ -113,6 +113,46 @@ namespace FisheyeFriend.Core.Defish
             return new DefishGeometry(() => new ModelPointMap(new DefishModelMap(model, adj, aspect)), aspect, nodesAcross, ct, model, adj);
         }
 
+        /// <summary>
+        /// Where the grid's nodes are for a frame of this shape: <paramref name="nu"/> x <paramref name="nv"/> nodes, node
+        /// (i, j) at u = <paramref name="u0"/> + i <paramref name="hu"/>, v = <paramref name="v0"/> + j <paramref name="hv"/>
+        /// (stored row by row). For geometries whose nodes are computed elsewhere (<see cref="FromNodes"/>).
+        /// </summary>
+        public static void GridLayout(double aspect, int nodesAcross, out int nu, out int nv, out double u0, out double v0, out double hu, out double hv)
+        {
+            hu = 1.0 / (nodesAcross - 1);
+            hv = hu / aspect;                       // square cells in pixels for images of this shape
+            u0 = -Margin;
+            v0 = -Margin;
+            nu = (int)Math.Ceiling((1 + 2 * Margin) / hu) + 1;
+            nv = (int)Math.Ceiling((1 + 2 * Margin) / hv) + 1;
+        }
+
+        /// <summary>
+        /// The model with an adjustment, from node values computed elsewhere (on the GPU): <paramref name="s"/> and
+        /// <paramref name="t"/> hold the photo point at each node of <see cref="GridLayout"/>, row by row.
+        /// </summary>
+        public static DefishGeometry FromNodes(DefishModel model, DefishAdjustment adjustment, double aspect, int nodesAcross, float[] s, float[] t)
+        {
+            var adj = (adjustment ?? new DefishAdjustment()).Clone();
+            adj.Validate();
+            return new DefishGeometry(() => new ModelPointMap(new DefishModelMap(model, adj, aspect)), aspect, nodesAcross, s, t, model, adj);
+        }
+
+        private DefishGeometry(Func<IDefishPointMap> exact, double aspect, int nodesAcross, float[] s, float[] t, DefishModel model, DefishAdjustment adjustment)
+        {
+            _exact = exact;
+            Model = model;
+            Adjustment = adjustment;
+            Aspect = aspect;
+            GridLayout(aspect, nodesAcross, out _nu, out _nv, out _u0, out _v0, out _hu, out _hv);
+            if (s == null || t == null || s.Length != _nu * _nv || t.Length != _nu * _nv)
+                throw new ArgumentException("The node arrays don't match the grid (" + _nu + " x " + _nv + ").");
+            _s = (float[])s.Clone();
+            _t = (float[])t.Clone();
+            MinAreaScale = ComputeMinAreaScale();
+        }
+
         private DefishGeometry(Func<IDefishPointMap> exact, double aspect, int nodesAcross, System.Threading.CancellationToken ct,
             DefishModel model = null, DefishAdjustment adjustment = null)
         {
@@ -120,12 +160,7 @@ namespace FisheyeFriend.Core.Defish
             Model = model;
             Adjustment = adjustment;
             Aspect = aspect;
-            _hu = 1.0 / (nodesAcross - 1);
-            _hv = _hu / aspect;                     // square cells in pixels for images of this shape
-            _u0 = -Margin;
-            _v0 = -Margin;
-            _nu = (int)Math.Ceiling((1 + 2 * Margin) / _hu) + 1;
-            _nv = (int)Math.Ceiling((1 + 2 * Margin) / _hv) + 1;
+            GridLayout(aspect, nodesAcross, out _nu, out _nv, out _u0, out _v0, out _hu, out _hv);
             _s = new float[_nu * _nv];
             _t = new float[_nu * _nv];
             var po = new ParallelOptions { CancellationToken = ct };
@@ -178,6 +213,38 @@ namespace FisheyeFriend.Core.Defish
         }
 
         public int GridNodes => _nu * _nv;
+        public int NodesU => _nu;
+        public int NodesV => _nv;
+        /// <summary>Normalised u and v of the cell size (the grid's spacing).</summary>
+        public double CellU => _hu;
+        public double CellV => _hv;
+
+        /// <summary>The photo point (normalised) stored at node <paramref name="index"/> (row by row).</summary>
+        public void Node(int index, out float s, out float t)
+        {
+            s = _s[index];
+            t = _t[index];
+        }
+
+        /// <summary>
+        /// The cell <see cref="Map"/> interpolates in at <paramref name="u"/>: the node column <paramref name="i"/> it starts
+        /// from (its 4 x 4 stencil spans columns i-1 .. i+2) and the position <paramref name="a"/> within it.
+        /// </summary>
+        public void CellAtU(double u, out int i, out double a)
+        {
+            double fu = (u - _u0) / _hu;
+            i = (int)Math.Floor(fu);
+            if (i < 1) i = 1; else if (i > _nu - 3) i = _nu - 3;
+            a = fu - i;
+        }
+
+        public void CellAtV(double v, out int j, out double b)
+        {
+            double fv = (v - _v0) / _hv;
+            j = (int)Math.Floor(fv);
+            if (j < 1) j = 1; else if (j > _nv - 3) j = _nv - 3;
+            b = fv - j;
+        }
 
         /// <summary>The exact map (slow: hundreds of spline terms, or a few Newton solves for a model).</summary>
         public void MapExact(double u, double v, out double s, out double t)

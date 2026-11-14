@@ -45,6 +45,12 @@ namespace FisheyeFriend.App
         public float defishHorizontal = 100f;
         public float defishVertical = 100f;
 
+        /// <summary>
+        /// Defish on the graphics card when it can (several times faster; the same result, see ConformanceTests). The user's
+        /// choice in the panel is remembered and wins over this.
+        /// </summary>
+        public bool useGpu = true;
+
         /// <summary>Defish each photo as soon as it is opened in interactive mode.</summary>
         public bool defishOnOpen = true;
 

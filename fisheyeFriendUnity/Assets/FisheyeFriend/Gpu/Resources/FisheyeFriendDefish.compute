@@ -1,0 +1,602 @@
+// Fisheye Friend's defish on the GPU: the same algorithm as the C# code in FisheyeFriend.Core, function for function.
+//
+//   MapModel  the defish model with the user's adjustment (DefishModel / DefishModelMap): for each point of the defished
+//             frame, the point of the photo it shows. Used to make the geometry's grid, and by the tests.
+//   Warp      the resampler (WarpResampler, separable kernels): each output pixel is mapped through the geometry's grid
+//             (Catmull-Rom, DefishGeometry.Map) and the photo is filtered there.
+//
+// The GPU computes in 32-bit floats, the CPU in doubles. Where that would show, the inputs are arranged so the floats keep
+// the precision: source positions are carried as a whole pixel plus a fraction (so a position on a 10000 pixel wide
+// photo is still exact to a millionth of a pixel), and every lookup table is the CPU's own, uploaded as is.
+
+#pragma kernel MapModel
+#pragma kernel Warp
+
+// ======================================================================================================== helpers
+
+float Comp(float4 v, int i)
+{
+    return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w));
+}
+
+float Clamp01(float v)
+{
+    if (!(v > 0.0)) return 0.0;
+    return v > 1.0 ? 1.0 : v;
+}
+
+// ======================================================================================================== the model
+
+float4 _Theta[2];           // lens: angle = sum theta[i] r^(2i+1), up to 8 terms (unused ones 0)
+float4 _Horizontal;         // projection corrections, up to 4 (unused 0)
+float4 _Vertical[4];        // [i][j], up to 4 x 4 (unused 0)
+float _Panini;
+float _PaniniVertical;
+float _K;                   // the projection's scale at this strength (keeps the width)
+float _Strength;
+float _AmountX;
+float _AmountY;
+float _Aspect;              // frame height / width
+float _RhoNorm;             // 1 / half the frame's diagonal (frame widths)
+float4 _ShapeX;
+float4 _ShapeY;
+int _Flat;                  // 1 when both shape curves are 100% everywhere
+int _PointCount;
+
+StructuredBuffer<float2> _Points;       // (u, v) of the defished frame, normalised
+RWStructuredBuffer<float2> _Mapped;     // (s, t) of the photo, normalised
+
+float LensAngle(float r)
+{
+    float r2 = r * r, p = r, s = 0.0;
+    [unroll] for (int i = 0; i < 8; i++)
+    {
+        s += Comp(_Theta[i >> 2], i & 3) * p;
+        p *= r2;
+    }
+    return s;
+}
+
+float LensAngleDerivative(float r)
+{
+    float r2 = r * r, p = 1.0, s = 0.0;
+    [unroll] for (int i = 0; i < 8; i++)
+    {
+        s += (2 * i + 1) * Comp(_Theta[i >> 2], i & 3) * p;
+        p *= r2;
+    }
+    return s;
+}
+
+float LensRadius(float theta)
+{
+    float t0 = _Theta[0].x;
+    float r = theta / t0;
+    for (int it = 0; it < 50; it++)
+    {
+        float f = LensAngle(r) - theta, d = LensAngleDerivative(r);
+        if (d <= 1e-9) d = t0;
+        float dStep = clamp(f / d, -0.2, 0.2);
+        r -= dStep;
+        if (r < 0.0) r = 0.0;
+        if (abs(dStep) < 1e-7) break;
+    }
+    return r;
+}
+
+float ProjectX(float lon, out float derivative)
+{
+    float s = sin(lon), c = cos(lon), u = s * s;
+    float den = _Panini + c;
+    float basis = (_Panini + 1.0) * s / den;
+    float dBasis = (_Panini + 1.0) * (c * den + s * s) / (den * den);
+    float corr = 1.0, dCorr = 0.0, prev = 1.0;
+    [unroll] for (int i = 0; i < 4; i++)
+    {
+        float h = Comp(_Horizontal, i);
+        corr += h * prev * u;
+        dCorr += h * (i + 1) * prev * 2.0 * s * c;
+        prev *= u;
+    }
+    derivative = dBasis * corr + basis * dCorr;
+    return basis * corr;
+}
+
+float ProjectY(float lon, float lat, out float dLat)
+{
+    float sl = sin(lon), cl = cos(lon), u = sl * sl;
+    float sp = sin(lat), cp = cos(lat), v = sp * sp;
+    float side = (_PaniniVertical + 1.0) / (_PaniniVertical + cl);
+    float tn = sp / cp, dTan = 1.0 / (cp * cp);
+    float corr = 1.0, dCorr = 0.0, prev = 1.0;
+    [unroll] for (int i = 0; i < 4; i++)
+    {
+        float row = 0.0, up = 1.0;
+        [unroll] for (int j = 0; j < 4; j++)
+        {
+            row += Comp(_Vertical[i], j) * up;
+            up *= u;
+        }
+        corr += row * prev * v;
+        dCorr += row * (i + 1) * prev * 2.0 * sp * cp;
+        prev *= v;
+    }
+    dLat = side * (dTan * corr + tn * dCorr);
+    return side * tn * corr;
+}
+
+float Tangent(float4 y, int k, float h)
+{
+    if (k == 0) return 0.0;
+    if (k == 3) return (y.w - y.z) / h;
+    float d0 = (Comp(y, k) - Comp(y, k - 1)) / h, d1 = (Comp(y, k + 1) - Comp(y, k)) / h;
+    if (d0 * d1 <= 0.0) return 0.0;
+    return 2.0 / (1.0 / d0 + 1.0 / d1);
+}
+
+// DefishAdjustment.ShapeAt
+float ShapeAt(float4 y, float rho)
+{
+    float h = 1.0 / 3.0;
+    if (rho <= 0.0) return y.x;
+    if (rho >= 1.0) return y.w + Tangent(y, 3, h) * (rho - 1.0);
+    int k = min(2, (int)(rho / h));
+    float t = (rho - k * h) / h;
+    float m0 = Tangent(y, k, h), m1 = Tangent(y, k + 1, h);
+    float t2 = t * t, t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * Comp(y, k) + (t3 - 2.0 * t2 + t) * h * m0 + (-2.0 * t3 + 3.0 * t2) * Comp(y, k + 1) + (t3 - t2) * h * m1;
+}
+
+// DefishModelMap.Map: the photo point (normalised) shown at defished point (u, v) (normalised)
+float2 MapPoint(float u, float v)
+{
+    float x = u - 0.5, y = (v - 0.5) * _Aspect;          // frame widths from the centre
+    // longitude: K ProjectX(lon) = x
+    float lon = atan(x / _K);
+    for (int it = 0; it < 60; it++)
+    {
+        float d;
+        float f = _K * ProjectX(lon, d) - x;
+        d *= _K;
+        if (!(d > 1e-9)) d = _K;
+        float dStep = clamp(f / d, -0.2, 0.2);
+        lon = clamp(lon - dStep, -1.55, 1.55);
+        if (abs(dStep) < 1e-7) break;
+    }
+    // latitude: K ProjectY(lon, lat) = y
+    float lat = atan(y / (_K * 1.2));
+    for (int it2 = 0; it2 < 60; it2++)
+    {
+        float d;
+        float f = _K * ProjectY(lon, lat, d) - y;
+        d *= _K;
+        if (!(d > 1e-9)) d = _K;
+        float dStep = clamp(f / d, -0.2, 0.2);
+        lat = clamp(lat - dStep, -1.5, 1.5);
+        if (abs(dStep) < 1e-7) break;
+    }
+    // the direction, and where the lens puts it
+    float cp = cos(lat);
+    float X = cp * sin(lon), Y = sin(lat), Z = cp * cos(lon);
+    float sinTh = sqrt(X * X + Y * Y);
+    float theta = atan2(sinTh, Z);
+    float sx, sy;
+    if (theta < 1e-9)
+    {
+        float inv = 1.0 / (_Theta[0].x * _Strength);
+        sx = X * inv;
+        sy = Y * inv;
+    }
+    else
+    {
+        float r = LensRadius(theta) / _Strength;
+        sx = r * X / sinTh;
+        sy = r * Y / sinTh;
+    }
+    float ax = _AmountX, ay = _AmountY;
+    if (_Flat == 0)
+    {
+        float rho = sqrt(x * x + y * y) * _RhoNorm;
+        ax *= ShapeAt(_ShapeX, rho);
+        ay *= ShapeAt(_ShapeY, rho);
+    }
+    sx = x + ax * (sx - x);
+    sy = y + ay * (sy - y);
+    return float2(sx + 0.5, sy / _Aspect + 0.5);
+}
+
+[numthreads(64, 1, 1)]
+void MapModel(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _PointCount) return;
+    float2 p = _Points[id.x];
+    _Mapped[id.x] = MapPoint(p.x, p.y);
+}
+
+// ======================================================================================================== the resampler
+
+// The geometry's grid in source pixels: each node's position split into a whole pixel and a fraction (made on the CPU in
+// double precision), so differences between nearby nodes are exact.
+struct Node
+{
+    int ix;
+    int iy;
+    float fx;
+    float fy;
+};
+
+// For each output column (row): the grid cell its centre falls in, and where in it (DefishGeometry.CellAtU / CellAtV).
+struct Cell
+{
+    int i;
+    float a;
+};
+
+StructuredBuffer<Node> _Nodes;
+StructuredBuffer<Cell> _Cols;
+StructuredBuffer<Cell> _Rows;
+int _NodesU;
+float _ColStep;             // grid cells per output pixel, across (du / hu)
+float _RowStep;             // and down (dv / hv)
+
+StructuredBuffer<uint> _Src;            // the photo's samples, packed: 4 per word (8-bit) or 2 (16-bit), little-endian
+int _SrcW;
+int _SrcH;
+int _Ch;                    // channels (1-4)
+int _Depth;                 // 8 or 16
+int _Alpha;                 // 1 when the last channel is alpha
+float _AlphaScale;          // 1 / max sample value
+StructuredBuffer<float> _ColorLut;      // sample -> working light (WarpResampler.DecodeTable)
+StructuredBuffer<float> _WeightLut;     // the kernel (WarpResampler.WeightTable)
+int _WeightLutSize;
+float _R;                   // kernel radius
+float _LutScale;            // (table size - 1) / radius
+int _Antialias;
+float _AaStrength;
+float _Aperture;
+int _SharpenOnly;
+StructuredBuffer<float> _ApTable;       // WarpResampler.ApertureTableValues
+int _ApCount;
+float _ApLogMin;
+float _ApLogMax;
+int _Extend;                // repeat the edge outside the photo (else the background, anti-aliased)
+float4 _Bg;                 // background in the working light space
+int _Light;                 // 0 linear, 1 gamma, 2 sigmoidal (LightSpace)
+StructuredBuffer<float> _FromSig;       // SigmoidCurve.FromTable (65537)
+StructuredBuffer<float> _Encode;        // Srgb.EncodeTable (65537)
+int _OutW;
+int _OutH;
+int _StripY0;
+int _StripRows;
+int _OutDepth;
+float _OutMax;
+RWStructuredBuffer<uint> _Out;          // one word per pixel (8-bit RGBA) or two (16-bit)
+
+#define MAX_TAPS 32
+
+uint SampleAt(int index)
+{
+    if (_Depth == 8)
+    {
+        uint w = _Src[index >> 2];
+        return (w >> ((index & 3) * 8)) & 0xFFu;
+    }
+    uint w2 = _Src[index >> 1];
+    return (w2 >> ((index & 1) * 16)) & 0xFFFFu;
+}
+
+float Lookup(float t)
+{
+    int i = (int)t;
+    if (i >= _WeightLutSize - 1) return _WeightLut[_WeightLutSize - 1];
+    float f = t - i;
+    float a = _WeightLut[i];
+    return a + (_WeightLut[i + 1] - a) * f;
+}
+
+// WarpResampler.Weight1D
+float Weight1D(float t, float inv, float ap)
+{
+    float u = abs(t * inv);
+    float w = u >= _R ? 0.0 : Lookup(u * _LutScale);
+    if (ap == 0.0) return w;
+    float um = abs((t - 1.0) * inv), up = abs((t + 1.0) * inv);
+    float wm = um >= _R ? 0.0 : Lookup(um * _LutScale);
+    float wp = up >= _R ? 0.0 : Lookup(up * _LutScale);
+    return (1.0 + 2.0 * ap) * w - ap * (wm + wp);
+}
+
+float Widen(float sq, float k)
+{
+    if (sq <= 1.0) return 1.0;
+    float f = 1.0 + k * (sqrt(sq) - 1.0);
+    return f * f;
+}
+
+float ApertureCoefficient(float scale)
+{
+    if (!(scale > 0.0)) return 0.0;
+    float t = (log(scale) - _ApLogMin) / (_ApLogMax - _ApLogMin) * (_ApCount - 1);
+    if (t <= 0.0) return _ApTable[0];
+    if (t >= _ApCount - 1) return _ApTable[_ApCount - 1];
+    int i = (int)t;
+    return _ApTable[i] + (_ApTable[i + 1] - _ApTable[i]) * (t - i);
+}
+
+float FromSigmoid(float v)
+{
+    if (!(v > 0.0)) return _FromSig[0];
+    if (v >= 1.0) return _FromSig[65535];
+    float p = v * 65535.0;
+    int i = (int)p;
+    float f = p - i;
+    float a = _FromSig[i];
+    return a + (_FromSig[i + 1] - a) * f;
+}
+
+float SrgbEncode(float l)
+{
+    if (!(l > 0.0)) return 0.0;
+    if (l >= 1.0) return 1.0;
+    float p = l * 65535.0;
+    int i = (int)p;
+    float f = p - i;
+    float a = _Encode[i];
+    return a + (_Encode[i + 1] - a) * f;
+}
+
+void CatmullRom(float x, out float4 w, out float4 d)
+{
+    float x2 = x * x, x3 = x2 * x;
+    w = float4(0.5 * (-x3 + 2.0 * x2 - x), 0.5 * (3.0 * x3 - 5.0 * x2 + 2.0), 0.5 * (-3.0 * x3 + 4.0 * x2 + x), 0.5 * (x3 - x2));
+    d = float4(0.5 * (-3.0 * x2 + 4.0 * x - 1.0), 0.5 * (9.0 * x2 - 10.0 * x), 0.5 * (-9.0 * x2 + 8.0 * x + 1.0), 0.5 * (3.0 * x2 - 2.0 * x));
+}
+
+// DefishWarpMap.Map through DefishGeometry.Map: the source position of output pixel (x, y) as a whole pixel and a fraction,
+// and the Jacobian d(source px) / d(output px). Interpolated from node differences to the cell's own node, so the floats
+// only ever hold small numbers.
+void MapPixel(int x, int y, out int ix, out float fx, out int iy, out float fy, out float j00, out float j01, out float j10, out float j11)
+{
+    Cell cu = _Cols[x];
+    Cell cv = _Rows[y];
+    float4 wa, da, wb, db;
+    CatmullRom(cu.a, wa, da);
+    CatmullRom(cv.a, wb, db);
+    Node b = _Nodes[cv.i * _NodesU + cu.i];
+    float sx0 = 0.0, sx1 = 0.0, sx2 = 0.0, sy0 = 0.0, sy1 = 0.0, sy2 = 0.0;
+    [unroll] for (int r = 0; r < 4; r++)
+    {
+        int o = (cv.i - 1 + r) * _NodesU + cu.i - 1;
+        float rs = 0.0, rds = 0.0, rt = 0.0, rdt = 0.0;
+        [unroll] for (int c = 0; c < 4; c++)
+        {
+            Node n = _Nodes[o + c];
+            float dx = (float)(n.ix - b.ix) + (n.fx - b.fx);
+            float dy = (float)(n.iy - b.iy) + (n.fy - b.fy);
+            float w = Comp(wa, c), dw = Comp(da, c);
+            rs += w * dx;
+            rds += dw * dx;
+            rt += w * dy;
+            rdt += dw * dy;
+        }
+        float wr = Comp(wb, r), dr = Comp(db, r);
+        sx0 += wr * rs;
+        sx1 += wr * rds;
+        sx2 += dr * rs;
+        sy0 += wr * rt;
+        sy1 += wr * rdt;
+        sy2 += dr * rt;
+    }
+    float f = b.fx + sx0;
+    float fl = floor(f);
+    ix = b.ix + (int)fl;
+    fx = f - fl;
+    f = b.fy + sy0;
+    fl = floor(f);
+    iy = b.iy + (int)fl;
+    fy = f - fl;
+    j00 = sx1 * _ColStep;
+    j01 = sx2 * _RowStep;
+    j10 = sy1 * _ColStep;
+    j11 = sy2 * _RowStep;
+}
+
+float4 LoadSamples(int si, int count)
+{
+    float4 v = float4(0.0, 0.0, 0.0, 0.0);
+    v.x = _ColorLut[SampleAt(si)];
+    if (count > 1) v.y = _ColorLut[SampleAt(si + 1)];
+    if (count > 2) v.z = _ColorLut[SampleAt(si + 2)];
+    if (count > 3) v.w = _ColorLut[SampleAt(si + 3)];
+    return v;
+}
+
+uint Quantize(float v)
+{
+    return (uint)(v * _OutMax + 0.5);
+}
+
+[numthreads(8, 8, 1)]
+void Warp(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x, yl = (int)id.y, y = _StripY0 + yl;
+    if (x >= _OutW || yl >= _StripRows || y >= _OutH) return;
+
+    int ch = _Ch;
+    bool alpha = _Alpha != 0;
+    int cc = alpha ? ch - 1 : ch;
+
+    int ix, iy;
+    float fx, fy, j00, j01, j10, j11;
+    MapPixel(x, y, ix, fx, iy, fy, j00, j01, j10, j11);
+
+    // how far inside the photo this pixel is, in output pixels (anti-aliased boundary)
+    float sxc = (float)ix + fx, syc = (float)iy + fy;
+    float nx = sqrt(j00 * j00 + j01 * j01), ny = sqrt(j10 * j10 + j11 * j11);
+    float inX = min(sxc + 0.5, _SrcW - 0.5 - sxc) / max(nx, 1e-9);
+    float inY = min(syc + 0.5, _SrcH - 0.5 - syc) / max(ny, 1e-9);
+    float cover = _Extend != 0 ? 1.0 : min(1.0, 0.5 + min(inX, inY));
+
+    float4 val;
+    if (cover <= 0.0)
+    {
+        val = alpha ? float4(0.0, 0.0, 0.0, 0.0) : _Bg;
+    }
+    else
+    {
+        // the footprint (only the anti-aliasing option widens it)
+        float a = j00 * j00 + j01 * j01, b = j00 * j10 + j01 * j11, d = j10 * j10 + j11 * j11;
+        float hx = _R, hy = _R;
+        if (_Antialias != 0 && (a > 1.0 || d > 1.0))
+        {
+            float tr = 0.5 * (a + d), disc = sqrt(0.25 * (a - d) * (a - d) + b * b);
+            float l1 = tr + disc, l2 = max(tr - disc, 0.0);
+            float e1x, e1y;
+            if (abs(b) > 1e-12) { e1x = b; e1y = l1 - a; }
+            else if (a >= d) { e1x = 1.0; e1y = 0.0; }
+            else { e1x = 0.0; e1y = 1.0; }
+            float n1 = sqrt(e1x * e1x + e1y * e1y);
+            e1x /= n1;
+            e1y /= n1;
+            float e2x = -e1y, e2y = e1x;
+            float c1 = Widen(l1, _AaStrength), c2 = Widen(l2, _AaStrength);
+            hx = _R * sqrt(c1 * e1x * e1x + c2 * e2x * e2x);
+            hy = _R * sqrt(c1 * e1y * e1y + c2 * e2y * e2y);
+        }
+        float invSx = 1.0, invSy = 1.0, apx = 0.0, apy = 0.0;
+        if (_Antialias != 0)
+        {
+            invSx = 1.0 / sqrt(Widen(a, _AaStrength));
+            invSy = 1.0 / sqrt(Widen(d, _AaStrength));
+        }
+        if (_Aperture != 0.0)
+        {
+            apx = _Aperture * ApertureCoefficient(sqrt(a));
+            apy = _Aperture * ApertureCoefficient(sqrt(d));
+            if (_SharpenOnly != 0)
+            {
+                if (apx < 0.0) apx = 0.0;
+                if (apy < 0.0) apy = 0.0;
+            }
+        }
+
+        // taps, relative to the whole pixel ix / iy: offsets stay small and exact
+        int ox0 = (int)ceil(fx - hx), ox1 = (int)floor(fx + hx);
+        int oy0 = (int)ceil(fy - hy), oy1 = (int)floor(fy + hy);
+        int nTx = min(ox1 - ox0 + 1, MAX_TAPS), nTy = oy1 - oy0 + 1;
+        float wx[MAX_TAPS];
+        int xo[MAX_TAPS];
+        float sumX = 0.0;
+        for (int k = 0; k < nTx; k++)
+        {
+            wx[k] = Weight1D((float)(ox0 + k) - fx, invSx, apx);
+            sumX += wx[k];
+            xo[k] = clamp(ix + ox0 + k, 0, _SrcW - 1);
+        }
+
+        float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+        float wsum = 0.0;
+        if (!alpha && (ch == 3 || ch == 1))
+        {
+            // WarpResampler's separable fast path: each source row summed across, then weighted once
+            float sumY = 0.0;
+            for (int r = 0; r < nTy; r++)
+            {
+                float wyr = Weight1D((float)(oy0 + r) - fy, invSy, apy);
+                if (wyr == 0.0) continue;
+                sumY += wyr;
+                int rb = clamp(iy + oy0 + r, 0, _SrcH - 1) * _SrcW;
+                float4 h = float4(0.0, 0.0, 0.0, 0.0);
+                for (int k2 = 0; k2 < nTx; k2++)
+                {
+                    h += wx[k2] * LoadSamples((rb + xo[k2]) * ch, ch);
+                }
+                acc += wyr * h;
+            }
+            wsum = sumX * sumY;
+        }
+        else
+        {
+            // the general path (alpha, or grey + alpha): premultiplied colour
+            for (int r = 0; r < nTy; r++)
+            {
+                float wyy = Weight1D((float)(oy0 + r) - fy, invSy, apy);
+                if (wyy == 0.0) continue;
+                int rb = clamp(iy + oy0 + r, 0, _SrcH - 1) * _SrcW;
+                for (int k2 = 0; k2 < nTx; k2++)
+                {
+                    float w = wyy * wx[k2];
+                    if (w == 0.0) continue;
+                    int si = (rb + xo[k2]) * ch;
+                    float al = alpha ? SampleAt(si + cc) * _AlphaScale : 1.0;
+                    float4 add = (w * LoadSamples(si, cc)) * al;     // colour (channels past cc load as 0)
+                    if (alpha)
+                    {
+                        if (cc == 1) add.y = w * al;                  // the alpha channel is channel cc
+                        else add.w = w * al;
+                    }
+                    acc += add;
+                    wsum += w;
+                }
+            }
+        }
+        float inv = wsum > 1e-12 ? 1.0 / wsum : 0.0;
+        val = acc * inv;
+        if (cover < 1.0) val = alpha ? val * cover : val * cover + _Bg * (1.0 - cover);
+    }
+
+    // back to the output's light, as WarpResampler and RowCodec do
+    if (_Light == 2)
+    {
+        if (alpha)
+        {
+            float al2 = Comp(val, cc);
+            if (!(al2 > 1e-7))
+            {
+                val = float4(0.0, 0.0, 0.0, 0.0);
+                if (cc == 1) val.y = al2; else val.w = al2;
+            }
+            else
+            {
+                float invA = 1.0 / al2;
+                val.x = FromSigmoid(val.x * invA) * al2;
+                if (cc > 1) val.y = FromSigmoid(val.y * invA) * al2;
+                if (cc > 2) val.z = FromSigmoid(val.z * invA) * al2;
+            }
+        }
+        else
+        {
+            val.x = FromSigmoid(val.x);
+            if (ch > 1) val.y = FromSigmoid(val.y);
+            if (ch > 2) val.z = FromSigmoid(val.z);
+            if (ch > 3) val.w = FromSigmoid(val.w);
+        }
+    }
+    bool toSrgb = _Light != 1;      // the working values are linear light: encode them
+    uint4 q = uint4(0, 0, 0, 0);
+    float invAl = 1.0;
+    if (alpha)
+    {
+        float al3 = Clamp01(Comp(val, cc));
+        if (cc == 1) q.y = Quantize(al3); else q.w = Quantize(al3);
+        invAl = al3 > 1e-7 ? 1.0 / al3 : 0.0;
+    }
+    for (int c = 0; c < cc; c++)
+    {
+        float v = Comp(val, c) * invAl;
+        v = toSrgb ? SrgbEncode(v) : Clamp01(v);
+        uint qc = Quantize(v);
+        if (c == 0) q.x = qc; else if (c == 1) q.y = qc; else if (c == 2) q.z = qc; else q.w = qc;
+    }
+
+    int o = yl * _OutW + x;
+    if (_OutDepth == 8)
+    {
+        _Out[o] = q.x | (q.y << 8) | (q.z << 16) | (q.w << 24);
+    }
+    else
+    {
+        _Out[2 * o] = q.x | (q.y << 16);
+        _Out[2 * o + 1] = q.z | (q.w << 16);
+    }
+}

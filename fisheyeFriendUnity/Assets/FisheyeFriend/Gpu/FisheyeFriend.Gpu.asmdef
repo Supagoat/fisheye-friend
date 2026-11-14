@@ -1,0 +1,16 @@
+{
+    "name": "FisheyeFriend.Gpu",
+    "rootNamespace": "FisheyeFriend.Gpu",
+    "references": [
+        "FisheyeFriend.Core"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

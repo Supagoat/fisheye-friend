@@ -53,6 +53,7 @@ namespace FisheyeFriend.App.UI
         private readonly Action<Action> _defer;
         private readonly Action _onChanged;
         private readonly LivePreview _preview = new LivePreview();
+        private readonly DefishEngine _engine;
         private bool _advancedOpen;
         private bool _linked;
         private bool _editY;                    // unlinked: which curve the graph edits
@@ -82,9 +83,10 @@ namespace FisheyeFriend.App.UI
 
         /// <param name="defer">Runs structural changes outside OnGUI (see FisheyeFriendApp.Defer).</param>
         /// <param name="onChanged">Called after a deferred change to the settings.</param>
-        public SettingsPanel(AppConfig cfg, Action<Action> defer, Action onChanged)
+        public SettingsPanel(AppConfig cfg, Action<Action> defer, Action onChanged, DefishEngine engine)
         {
             _cfg = cfg;
+            _engine = engine;
             _defer = defer;
             _onChanged = onChanged;
             _linked = Prefs.GetBool("DefishLinked", true);
@@ -222,6 +224,19 @@ namespace FisheyeFriend.App.UI
             }
             GUILayout.EndHorizontal();
             if (description.Length > 0) GUILayout.Label(description, ui.MutedSmall);
+
+            // ---------------------------------------------------------------- GPU
+            GUILayout.Label("SPEED", ui.Section);
+            bool gpuAvailable = _engine.Available;
+            bool wasOn = GUI.enabled;
+            GUI.enabled = wasOn && gpuAvailable;
+            bool useGpu = ui.Toggle(gpuAvailable && _engine.Enabled, new GUIContent("Use the GPU",
+                "Defish on the graphics card: several times faster, with the same result. The GPU runs the same resampler on the " +
+                "same geometry; tested to give equal pixels except for the odd value on a rounding boundary, and then by one level " +
+                "(of 255, or of 65535 for 16-bit photos). Off: everything on the CPU."));
+            GUI.enabled = wasOn;
+            if (gpuAvailable && useGpu != _engine.Enabled) _engine.Enabled = useGpu;
+            if (!gpuAvailable) GUILayout.Label("Not available here: " + _engine.Unavailable + ". Defishing runs on the CPU.", ui.MutedSmall);
 
             // ---------------------------------------------------------------- advanced
             if (GUILayout.Button(_advancedOpen ? "Advanced  ^" : "Advanced  v", ui.Button))

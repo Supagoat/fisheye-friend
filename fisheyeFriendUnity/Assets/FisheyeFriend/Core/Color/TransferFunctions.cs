@@ -25,6 +25,9 @@ namespace FisheyeFriend.Core.Color
             return l <= 0.0031308 ? l * 12.92 : 1.055 * Math.Pow(l, 1.0 / 2.4) - 0.055;
         }
 
+        /// <summary>The encoding table <see cref="Encode"/> interpolates (65537 entries over 0..1 in steps of 1/65535; a copy).</summary>
+        public static float[] EncodeTable => (float[])s_encode.Clone();
+
         /// <summary>Table mapping 8-bit sRGB codes to linear light in [0,1].</summary>
         public static float[] Decode8 => s_decode8;
 
@@ -124,6 +127,10 @@ namespace FisheyeFriend.Core.Color
         {
             return 1.0 / (1.0 + Math.Exp(Slope * (Center - x)));
         }
+
+        /// <summary>The tables <see cref="ToSigmoid"/> and <see cref="FromSigmoid"/> interpolate (65537 entries, steps of 1/65535; copies).</summary>
+        public float[] ToTable => (float[])_toSig.Clone();
+        public float[] FromTable => (float[])_fromSig.Clone();
 
         public float ToSigmoid(float linear)
         {

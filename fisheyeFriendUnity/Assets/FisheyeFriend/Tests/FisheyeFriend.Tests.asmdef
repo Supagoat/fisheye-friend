@@ -3,6 +3,7 @@
     "rootNamespace": "FisheyeFriend.Tests",
     "references": [
         "FisheyeFriend.Core",
+        "FisheyeFriend.Gpu",
         "UnityEngine.TestRunner",
         "UnityEditor.TestRunner"
     ],

@@ -2,7 +2,8 @@
     "name": "FisheyeFriend.App",
     "rootNamespace": "FisheyeFriend.App",
     "references": [
-        "FisheyeFriend.Core"
+        "FisheyeFriend.Core",
+        "FisheyeFriend.Gpu"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],

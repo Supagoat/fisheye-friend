@@ -373,7 +373,8 @@ namespace FisheyeFriend.App
                 _busy = "Defishing";
                 sw.Restart();
                 _progress.BeginStage("Resampling", 0f, 0.85f);
-                var result = await Task.Run(() => Defisher.Process(src, g, settings, _progress, ct), ct);
+                var outcome = await _app.Engine.DefishAsync(src, g, settings, _progress, ct);
+                var result = outcome.Image;
                 if (src != _original) return;   // another photo was opened meanwhile
                 _progress.BeginStage("Preparing view", 0.85f, 0.15f);
                 var layer = await ImageLayer.CreateAsync(result);
@@ -396,7 +397,8 @@ namespace FisheyeFriend.App
                 }
                 if (previous != null) previous.Dispose();
                 _app.ShowInfo("Defished to " + result.Width + " x " + result.Height + " in " +
-                              sw.Elapsed.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + " s (" + Describe(settings) + ")");
+                              sw.Elapsed.TotalSeconds.ToString("0.00", CultureInfo.InvariantCulture) + " s " + DefishEngine.Where(outcome) +
+                              " (" + Describe(settings) + ")");
                 GC.Collect();
             }
             catch (OperationCanceledException)

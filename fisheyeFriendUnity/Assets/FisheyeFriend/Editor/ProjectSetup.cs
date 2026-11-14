@@ -60,7 +60,7 @@ namespace FisheyeFriend.EditorTools
             string[] keys =
             {
                 "OutputSize", "Edges", "Kernel", "Radius", "Light", "Antialias", "Aperture", "DefishOnOpen",
-                "Strength", "AmountX", "AmountY", "ShapeX", "ShapeY", "DefishLinked",
+                "Strength", "AmountX", "AmountY", "ShapeX", "ShapeY", "DefishLinked", "UseGpu",
                 "SaveFormat", "OpenDir", "SaveDir", "Mode", "BatchIn", "BatchOut", "BatchSubfolders", "BatchOverwrite", "BatchSuffix",
             };
             foreach (var k in keys) PlayerPrefs.DeleteKey("FisheyeFriend." + k);

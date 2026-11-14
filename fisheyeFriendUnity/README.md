@@ -81,6 +81,8 @@ Pick an input and an output folder. Every `.jpg/.jpeg/.png` is defished with the
   reaches up to about 5 pixels past the photo (on a 42 MP frame), and those pixels repeat its edge. *Crop to
   photo* crops 0.3% each way so every pixel comes from the photo.
 * **Filter.** Lanczos 4 (default), Lanczos 3, Bicubic.
+* **Speed.** *Use the GPU* (default on): the same defish on the graphics card, several times faster (see
+  [On the GPU](#on-the-gpu)).
 * **Advanced.** Light space (Sigmoidal default), aperture correction (on), anti-aliasing of the centre (off),
   reset to defaults.
 
@@ -239,9 +241,68 @@ precomputed separable weights.
 
 On the 2-core machine used for development, a 7952 x 5304 (42 MP) photo defishes in about 12 s with
 Lanczos 4 (9 s with Lanczos 3), against 24 s for the old sampling loop alone, even with the new fast map.
-The work is spread over all cores, so a desktop with more cores is proportionally faster. The GPU preview of
-the old version is gone: its shader used the same blurring radial kernel, and the CPU path is now fast enough
-to show the final result directly.
+The work is spread over all cores, so a desktop with more cores is proportionally faster. (The old version's
+GPU preview used the blurring radial kernel; it is gone.)
+
+### On the GPU
+
+With **Use the GPU** on (the default, under *Speed* in the panel; `useGpu` in the config), the resampling runs on
+the graphics card in a compute shader (`Assets/FisheyeFriend/Gpu/Resources/FisheyeFriendDefish.compute`). It is
+the same algorithm, function for function: the same kernel tables, light-space curves, aperture correction,
+anti-aliasing and edge handling, uploaded from the CPU code rather than recomputed. The geometry is the same exact
+one the CPU uses (made once per adjustment in double precision, and kept), so the two give the same picture.
+
+GPUs compute in 32-bit floats, the CPU in doubles, so bit-for-bit equality isn't possible; the shader is built to
+come as close as floats allow. Each output pixel's source position is carried as a whole pixel plus a fraction,
+interpolated from differences between neighbouring grid nodes, so on a 10000-pixel-wide photo it is still exact to
+about a millionth of a pixel (a plain float would be off by up to 1/2000 px). Measured with an exact float emulation
+of the shader: 99.997% of 8-bit samples identical to the CPU's (the rest differ by one level, where a value sits on a
+rounding boundary), 99.4-99.6% of 16-bit samples (the rest by 1 of 65535); with no correction the photo comes back
+exactly. Photos are processed in strips of about 4 million pixels; the photo, the result strips and the tables must
+fit the card's largest buffer, and the radial filter (not offered in the panel) runs on the CPU only. Whenever the
+GPU can't do a job it falls back to the CPU and says why in the status line.
+
+The shader also holds the model itself (the `MapModel` kernel: lens, projection, strength, amounts and curves).
+In 32-bit floats it lands within 0.0013 px of the golden points on an 8000-pixel frame, but a geometry built from
+it differs from the CPU's by up to 0.003 px, which can move 16-bit results by a few units. So the app builds the
+geometry on the CPU (a fraction of a second, once per adjustment) and uses the GPU where the time goes. The tests
+check both kernels.
+
+---
+
+## Testing
+
+`Tools/TestData` holds the defish conformance data that every implementation is held to:
+
+* `defish-golden.json`: for 14 cases (frame shapes from 16:9 to square; strength 50-115%; amounts 0-150%; shape
+  curves, linked and separate), 140 points each of the defished frame with the photo point they show. Made by
+  `golden.py`, an independent implementation of the model in Python that solves its equations by bisection, not
+  Newton's method. The C# model agrees to 4e-12 px.
+* `render-*.png`: the CPU defish of deterministic test images (made with integer arithmetic, so identical on every
+  computer) for 9 render cases covering every image layout (grey, RGB, RGBA; 8 and 16 bits; portrait with an
+  orientation tag) and every option (filters, light spaces, anti-aliasing, aperture correction, crop) at various
+  adjustments, plus noise (the worst case for a resampler) and no correction (the photo must come back unchanged).
+
+`Assets/FisheyeFriend/Tests/ConformanceTests.cs` (Window > General > Test Runner, EditMode) runs them:
+
+| Test | Holds | to |
+|---|---|---|
+| `Cpu_ModelMatchesGoldenPoints` | the C# model | < 0.0001 px of the golden points (8000 px frame) |
+| `Cpu_GeometryMatchesGoldenPoints` | the interpolated grid the renderer uses | < 0.002 px |
+| `Cpu_RenderMatchesGolden` | the CPU defish | the golden renders (1 level for the odd value another computer's maths library rounds differently) |
+| `Cpu_NoCorrectionGivesThePhotoBack` | 0% amounts | the photo, exactly |
+| `Gpu_ModelMatchesGoldenPoints` | the shader's model | < 0.01 px |
+| `Gpu_GeometryMatchesCpuGeometry` | a grid made on the GPU | < 0.01 px of the CPU's, same fold check |
+| `Gpu_RenderMatchesCpu` | the GPU defish | the CPU's: at most 1 level apart, at least 99.9% (8-bit) / 99% (16-bit) of samples identical; exact with no correction |
+| `Gpu_RenderMatchesGolden` | the GPU defish | the golden renders, the same way |
+| `Gpu_StripsJoinSeamlessly` | strips of 7 rows | one dispatch, exactly |
+| `Gpu_GeometryAndRenderMatchCpu` | everything on the GPU | within 1 level (8-bit), 8 of 65535 (16-bit) |
+
+Each test prints what it measured. **Fisheye Friend > Check GPU Against CPU** runs the GPU checks in one go, times a
+24 MP photo on the CPU and the GPU, and writes everything to `Tools/TestData/gpu-report.txt`. The bench runs the same
+suite without Unity: `conformance Tools/TestData`
+(the CPU; `write` remakes the golden renders) and `gpu-emulate Tools/TestData` (the shader, emulated in 32-bit
+floats line for line by `Tools/Bench/GpuEmulator.cs`).
 
 ---
 
@@ -250,15 +311,19 @@ to show the final result directly.
 ```
 Assets/FisheyeFriend/Core      the library: the defish model and its adjustment (DefishModel), the point pairs
                                (HemiMapping, ThinPlateSpline), DefishGeometry, Defisher, DefishPreview, the warp
-                               resampler, codecs (JPEG/PNG with metadata), batch planning
-Assets/FisheyeFriend/App       the app: FisheyeFriendApp (shell), InteractiveMode, BatchMode, Projection,
+                               resampler, codecs (JPEG/PNG with metadata), batch planning, the GPU's preparation
+                               (GpuPlan) and the conformance suite (Testing/Conformance)
+Assets/FisheyeFriend/Gpu       the compute shader (Resources/FisheyeFriendDefish.compute) and GpuDefisher
+Assets/FisheyeFriend/App       the app: FisheyeFriendApp (shell), InteractiveMode, BatchMode, Projection, DefishEngine,
                                SettingsPanel (with the curve editor), LivePreview, viewer, styles, native file
                                dialogs, prefs, config
 Assets/FisheyeFriend/Editor    player-settings setup and the Fisheye Friend menu
 Assets/FisheyeFriend/Tests     EditMode tests (Window > General > Test Runner)
 Assets/StreamingAssets         fisheye-friend-config.json, defish-hemi-model.json (the model), defish-hemi-596.json
                                (the original point pairs)
-Tools/Bench                    command-line bench: self-tests, the quality experiment, timing
+Tools/Bench                    command-line bench: self-tests, the conformance suite, the GPU emulator, the quality
+                               experiment, timing
+Tools/TestData                 golden points (golden.py) and golden renders
 Legacy (Unity 2021)            the previous project, unchanged
 ```
 
