@@ -1,0 +1,50 @@
+{
+  "format": "fisheye-friend-defish-model",
+  "formatVersion": 1,
+  "name": "Hemi",
+  "description": "Fitted to the 596 hand-placed point pairs of defish-hemi-596.json (0.9 px RMS). A fisheye lens seen through a Panini-style cylindrical projection: vertical lines straight, horizontal lines gently curved.",
+  "lens": {
+    "theta": [
+      2.331570216256887,
+      0.24359368632643005,
+      -0.4135582541599703,
+      4.3519581618197005
+    ],
+    "note": "angle from the optical axis (radians) = sum theta[i] r^(2i+1), r = distance from the photo's centre in photo widths"
+  },
+  "projection": {
+    "scale": 0.3591980688944844,
+    "panini": 1.1247429558441109,
+    "paniniVertical": 2.3143462334046765,
+    "horizontal": [
+      0.04343423280488648,
+      -0.015420606868319116
+    ],
+    "vertical": [
+      [
+        -0.028188129209643746,
+        -0.08957917940386168,
+        0.6556793921745786,
+        -0.5603986482144145
+      ],
+      [
+        -0.364788678123393,
+        0.6396620530198249,
+        -3.4765387414545397,
+        2.870224602088231
+      ],
+      [
+        0.2497711231725929,
+        -0.793538658554969,
+        4.4518517867127905,
+        -3.4005833609102267
+      ]
+    ],
+    "note": "x = scale * (panini+1) sin(lon)/(panini+cos(lon)) * (1 + sum horizontal[i] sin^(2i+2) lon); y = scale * (paniniVertical+1)/(paniniVertical+cos(lon)) * tan(lat) * (1 + sum vertical[i][j] sin^(2i+2) lat sin^(2j) lon), in frame widths"
+  },
+  "fit": {
+    "points": 541,
+    "rmsPixels6000": 0.9,
+    "maxPixels6000": 2.02
+  }
+}

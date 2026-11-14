@@ -367,7 +367,8 @@ namespace FisheyeFriend.App
             try
             {
                 if (!_app.Projection.Ready) _busy = "Preparing the projection";
-                var g = await _app.Projection.GetAsync();
+                else if (_app.Projection.PeekGeometry(Defisher.SensorAspect(src), settings.Adjust) == null) _busy = "Preparing the defish";
+                var g = await _app.Projection.GeometryAsync(Defisher.SensorAspect(src), settings.Adjust);
                 ct.ThrowIfCancellationRequested();
                 _busy = "Defishing";
                 sw.Restart();
@@ -416,7 +417,18 @@ namespace FisheyeFriend.App
         internal static string Describe(DefishSettings s)
         {
             return SettingsPanel.FilterName(s) + ", " + (s.OutputSize == DefishOutputSize.FullDetail ? "full detail" : "photo size") +
-                   (s.Edges == DefishEdges.Crop ? ", cropped to the photo" : "");
+                   (s.Edges == DefishEdges.Crop ? ", cropped to the photo" : "") + DescribeAdjustment(s.Adjust);
+        }
+
+        internal static string DescribeAdjustment(DefishAdjustment a)
+        {
+            if (a == null || a.IsDefault) return "";
+            var ci = CultureInfo.InvariantCulture;
+            string t = ", lens " + (a.Strength * 100).ToString("0", ci) + "%";
+            if (Math.Abs(a.AmountX - a.AmountY) < 1e-9) t += ", amount " + (a.AmountX * 100).ToString("0", ci) + "%";
+            else t += ", horizontal " + (a.AmountX * 100).ToString("0", ci) + "%, vertical " + (a.AmountY * 100).ToString("0", ci) + "%";
+            if (!a.ShapesFlat) t += ", curved";
+            return t;
         }
 
         private async void SaveAs()

@@ -227,6 +227,141 @@ namespace FisheyeFriend.Tests
                 }
         }
 
+        // ------------------------------------------------------------------ the defish model and its adjustment
+
+        private const double Frame = 2.0 / 3.0;
+        private static DefishGeometry _modelGeometry;
+
+        private static DefishGeometry ModelGeometry
+        {
+            get
+            {
+                if (_modelGeometry == null) _modelGeometry = DefishGeometry.FromModel(DefishModel.Hemi, new DefishAdjustment(), Frame);
+                return _modelGeometry;
+            }
+        }
+
+        [Test]
+        public void Model_FileIsTheBuiltInModel()
+        {
+            string path = Path.Combine(Application.streamingAssetsPath, "defish-hemi-model.json");
+            var file = DefishModel.Parse(File.ReadAllText(path));
+            var hemi = DefishModel.Hemi;
+            CollectionAssert.AreEqual(hemi.Theta, file.Theta);
+            CollectionAssert.AreEqual(hemi.Horizontal, file.Horizontal);
+            CollectionAssert.AreEqual(hemi.Vertical, file.Vertical);
+            Assert.AreEqual(hemi.Scale, file.Scale);
+            var back = DefishModel.Parse(file.ToJson());
+            CollectionAssert.AreEqual(file.Theta, back.Theta);
+            CollectionAssert.AreEqual(file.Vertical, back.Vertical);
+            Assert.Throws<FormatException>(() => DefishModel.Parse("{\"lens\": {}}"));
+        }
+
+        [Test]
+        public void Model_MatchesTheMeasuredPointPairs()
+        {
+            double sum = 0, mx = 0;
+            int n = 0;
+            for (int j = 0; j < 40; j++)
+                for (int i = 0; i < 60; i++)
+                {
+                    double u = (i + 0.5) / 60, v = (j + 0.5) / 40, s1, t1, s2, t2, a, b, c, d;
+                    ModelGeometry.Map(u, v, out s1, out t1, out a, out b, out c, out d);
+                    Geometry.Map(u, v, out s2, out t2, out a, out b, out c, out d);
+                    double e = Math.Sqrt(Math.Pow((s1 - s2) * 6000, 2) + Math.Pow((t1 - t2) * 4000, 2));
+                    sum += e * e;
+                    n++;
+                    mx = Math.Max(mx, e);
+                }
+            Assert.Less(Math.Sqrt(sum / n), 1.2, "rms px");
+            Assert.Less(mx, 3, "max px");
+            Assert.Less(ModelGeometry.MaxGridError(7952, 5304, 5000, 3), 0.01);
+        }
+
+        [Test]
+        public void Model_NoCorrectionLeavesThePhoto()
+        {
+            var m = new DefishModelMap(DefishModel.Hemi, new DefishAdjustment { Strength = 0.7, AmountX = 0, AmountY = 0 }, Frame);
+            for (int j = 0; j <= 8; j++)
+                for (int i = 0; i <= 8; i++)
+                {
+                    double s, t;
+                    m.Map(i / 8.0, j / 8.0, out s, out t);
+                    Assert.AreEqual(i / 8.0, s, 1e-12);
+                    Assert.AreEqual(j / 8.0, t, 1e-12);
+                }
+        }
+
+        [Test]
+        public void Model_IsSymmetric()
+        {
+            var m = new DefishModelMap(DefishModel.Hemi, new DefishAdjustment { Strength = 1.1, AmountX = 0.8, ShapeY = new[] { 1, 0.9, 0.7, 0.5 } }, Frame);
+            var rnd = new System.Random(2);
+            for (int k = 0; k < 200; k++)
+            {
+                double u = rnd.NextDouble(), v = rnd.NextDouble(), s, t, s2, t2;
+                m.Reset(); m.Map(u, v, out s, out t);
+                m.Reset(); m.Map(1 - u, 1 - v, out s2, out t2);
+                Assert.AreEqual(1, s + s2, 1e-9);
+                Assert.AreEqual(1, t + t2, 1e-9);
+            }
+        }
+
+        [Test]
+        public void Model_DoesNotFoldOverTheOfferedRange()
+        {
+            foreach (var st in new[] { DefishAdjustment.MinStrength, 1.0, DefishAdjustment.MaxStrength })
+                foreach (var amount in new[] { 0.0, 1.0, DefishAdjustment.MaxAmount })
+                    Assert.IsFalse(DefishGeometry.FromModel(DefishModel.Hemi, new DefishAdjustment { Strength = st, AmountX = amount, AmountY = amount }, Frame, 129).Folds,
+                        "strength " + st + ", amount " + amount);
+            var zig = new[] { 0.0, 2, 0, 2 };
+            var folding = DefishGeometry.FromModel(DefishModel.Hemi, new DefishAdjustment { ShapeX = zig, ShapeY = zig }, Frame, 129);
+            Assert.IsTrue(folding.Folds);
+            Assert.Throws<InvalidOperationException>(() => Defisher.Process(Noise(60, 40, 3, 8, 1), folding, new DefishSettings()));
+        }
+
+        [Test]
+        public void Model_StrengthChangesTheLens()
+        {
+            var hemi = DefishModel.Hemi;
+            Assert.AreEqual(177, hemi.DiagonalFieldOfView(Frame), 1);
+            Assert.Less(hemi.DiagonalFieldOfView(Frame, 0.8), hemi.DiagonalFieldOfView(Frame));
+            double k0 = Defisher.CentreScale(DefishGeometry.FromModel(hemi, new DefishAdjustment { Strength = 0.6 }, Frame, 129), 600, 400);
+            double k1 = Defisher.CentreScale(ModelGeometry, 600, 400);
+            Assert.Less(k0, k1);
+            Assert.AreEqual(1.19, k1, 0.02);
+        }
+
+        [Test]
+        public void Adjustment_ValidatesAndCompares()
+        {
+            var a = new DefishAdjustment { Strength = 5, AmountX = -2, AmountY = double.NaN, ShapeX = new[] { 3.0 }, ShapeY = null };
+            a.Validate();
+            Assert.AreEqual(DefishAdjustment.MaxStrength, a.Strength);
+            Assert.AreEqual(0, a.AmountX);
+            Assert.AreEqual(1, a.AmountY);
+            CollectionAssert.AreEqual(new[] { 2.0, 1, 1, 1 }, a.ShapeX);
+            Assert.AreEqual(4, a.ShapeY.Length);
+            Assert.IsTrue(a.Same(a.Clone()));
+            Assert.IsFalse(a.Same(new DefishAdjustment()));
+            var s = new DefishSettings();
+            var c = s.Clone();
+            c.Adjust.ShapeX[1] = 0.5;
+            Assert.AreEqual(1, s.Adjust.ShapeX[1]);
+            Assert.IsFalse(s.Same(c));
+            Assert.AreEqual(0.5, DefishAdjustment.ShapeAt(new[] { 1.0, 1, 0.5, 0 }, 2.0 / 3), 1e-12);
+        }
+
+        [Test]
+        public void Preview_WithoutCorrectionShowsThePhoto()
+        {
+            var src = Noise(90, 60, 4, 8, 7);
+            var none = DefishGeometry.FromModel(DefishModel.Hemi, new DefishAdjustment { AmountX = 0, AmountY = 0 }, Frame, 129);
+            var pic = DefishPreview.Render(src.Data8, 90, 60, Orientation.Normal, none, 90, 60);
+            for (int i = 0; i < pic.Length; i++)
+                if (i % 4 != 3) Assert.LessOrEqual(Math.Abs(pic[i] - src.Data8[i]), 1);
+        }
+
         [Test]
         public void Png_RoundTripsAllLayouts()
         {

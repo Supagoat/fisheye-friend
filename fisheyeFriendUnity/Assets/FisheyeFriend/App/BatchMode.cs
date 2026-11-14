@@ -259,7 +259,6 @@ namespace FisheyeFriend.App
             try
             {
                 if (!_app.Projection.Ready) _itemProgress.BeginStage("Preparing the projection", 0f, 0f);
-                var g = await _app.Projection.GetAsync();
                 Directory.CreateDirectory(_options.OutputFolder);
                 for (int i = 0; i < _items.Count; i++)
                 {
@@ -273,6 +272,8 @@ namespace FisheyeFriend.App
                     {
                         _itemProgress.BeginStage("Loading", 0f, 0.1f);
                         var img = await ImageLoader.LoadAsync(it.InputPath, ct);
+                        // the geometry belongs to the frame's shape: made once for each shape in the batch (and kept)
+                        var g = await _app.Projection.GeometryAsync(Defisher.SensorAspect(img), settings.Adjust);
                         _itemProgress.BeginStage("Defishing", 0.1f, 0.6f);
                         bool shape = Defisher.ShapeDiffers(g, img);
                         var outImg = await Task.Run(() => Defisher.Process(img, g, settings, _itemProgress, ct), ct);

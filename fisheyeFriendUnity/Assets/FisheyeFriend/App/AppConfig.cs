@@ -17,13 +17,19 @@ namespace FisheyeFriend.App
     {
         public const string FileName = "fisheye-friend-config.json";
 
-        /// <summary>The projection: a point-pair file in Fisheye Friend's format, in StreamingAssets (or an absolute path).</summary>
-        public string projectionFile = "defish-hemi-596.json";
+        /// <summary>
+        /// The projection, in StreamingAssets (or an absolute path): a defish model (defish-hemi-model.json, adjustable),
+        /// or a point-pair file in Fisheye Friend's original format (defish-hemi-596.json: fixed splines, not adjustable).
+        /// </summary>
+        public string projectionFile = "defish-hemi-model.json";
         /// <summary>Name shown for the projection.</summary>
         public string projectionName = "Hemi";
 
-        /// <summary>"SameAsPhoto" or "FullDetail" (about 1.19x larger, so the centre keeps every pixel).</summary>
-        public string outputSize = "SameAsPhoto";
+        /// <summary>
+        /// "FullDetail" (about 1.19x larger, so the centre keeps the photo's sharpness) or "SameAsPhoto" (the photo's size,
+        /// as the old Fisheye Friend made it; the centre is reduced 1.19x and loses its finest detail).
+        /// </summary>
+        public string outputSize = "FullDetail";
         /// <summary>"Extend" (keep the full frame) or "Crop" (to the area the photo covers).</summary>
         public string edges = "Extend";
         /// <summary>Lanczos lobes for the warp: 4 (best), 3, or 2 for bicubic.</summary>
@@ -32,6 +38,12 @@ namespace FisheyeFriend.App
         public string lightSpace = "Sigmoidal";
         public bool antialias = false;
         public bool apertureCorrection = true;
+
+        /// <summary>Default lens strength in percent (100 = the lens the model was fitted to, a 177° diagonal fisheye on 3:2).</summary>
+        public float defishStrength = 100f;
+        /// <summary>Default horizontal and vertical amounts of the correction, in percent.</summary>
+        public float defishHorizontal = 100f;
+        public float defishVertical = 100f;
 
         /// <summary>Defish each photo as soon as it is opened in interactive mode.</summary>
         public bool defishOnOpen = true;
@@ -73,7 +85,7 @@ namespace FisheyeFriend.App
 
         private void Sanitize()
         {
-            if (string.IsNullOrWhiteSpace(projectionFile)) projectionFile = "defish-hemi-596.json";
+            if (string.IsNullOrWhiteSpace(projectionFile)) projectionFile = "defish-hemi-model.json";
             if (string.IsNullOrWhiteSpace(projectionName)) projectionName = Path.GetFileNameWithoutExtension(projectionFile);
             if (lanczosLobes < 2 || lanczosLobes > 4) lanczosLobes = 4;
             if (maxZoom < 1) maxZoom = 1;
@@ -95,11 +107,12 @@ namespace FisheyeFriend.App
         {
             var s = new DefishSettings
             {
-                OutputSize = ParseEnum(outputSize, DefishOutputSize.SameAsPhoto),
+                OutputSize = ParseEnum(outputSize, DefishOutputSize.FullDetail),
                 Edges = ParseEnum(edges, DefishEdges.Extend),
                 Light = ParseEnum(lightSpace, LightSpace.Sigmoidal),
                 Antialias = antialias,
                 ApertureCorrection = apertureCorrection,
+                Adjust = new DefishAdjustment { Strength = defishStrength / 100.0, AmountX = defishHorizontal / 100.0, AmountY = defishVertical / 100.0 },
             };
             if (lanczosLobes == 2)
             {

@@ -52,6 +52,7 @@ namespace FisheyeFriend.App
         private void Update()
         {
             Projection.Tick();
+            _panel.Tick(Settings, _mode == Mode.Interactive ? _interactive.Original : null, Projection);
             if (!_projectionReported && Projection.Failed)
             {
                 _projectionReported = true;
@@ -270,6 +271,7 @@ namespace FisheyeFriend.App
         {
             if (_interactive != null) _interactive.Dispose();
             if (_batch != null) _batch.Dispose();
+            if (_panel != null) _panel.Dispose();
             _ui.Release();
             Prefs.Flush();
         }

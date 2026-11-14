@@ -4,14 +4,23 @@ using FisheyeFriend.Core.Resampling;
 
 namespace FisheyeFriend.Core.Defish
 {
+    /// <summary>An exact defish map: defished point -> photo point, both normalised. Each instance is used by one thread.</summary>
+    public interface IDefishPointMap
+    {
+        void Map(double u, double v, out double s, out double t);
+        /// <summary>Forget any warm start (the next point is unrelated to the last).</summary>
+        void Reset();
+    }
+
     /// <summary>
     /// The defish projection: for a point of the defished image (normalised 0..1 across its width and height, pixel
     /// edges), the point of the fisheye photo to read, in the same normalised units.
     ///
-    /// Defined by thin-plate splines through the mapping's point pairs (exactly Fisheye Friend's fit). Evaluating the 596-term
-    /// splines for every pixel is what made the original "sharp" render take minutes, so the splines are evaluated
-    /// exactly on a fine grid once (normalised, so one grid serves every image size) and interpolated bicubically
-    /// between the nodes; see <see cref="MaxGridError"/> for the error that adds.
+    /// Defined either by a <see cref="DefishModel"/> with the user's <see cref="DefishAdjustment"/> (the default), or by
+    /// thin-plate splines through Fisheye Friend's hand-placed point pairs (the original definition, kept for
+    /// comparison). Either way the exact map is evaluated once on a fine grid (normalised, so one grid serves every
+    /// image size of the same shape) and interpolated bicubically between the nodes; see <see cref="MaxGridError"/> for
+    /// the error that adds.
     /// </summary>
     public sealed class DefishGeometry
     {
@@ -20,42 +29,162 @@ namespace FisheyeFriend.Core.Defish
         private readonly int _nu, _nv;
         private readonly double _u0, _v0, _hu, _hv;
         private readonly float[] _s, _t;          // normalised source x / y at each node (double precision is not needed: ~1e-7)
-        private readonly ThinPlateSpline _tx, _ty;
+        private readonly Func<IDefishPointMap> _exact;
 
+        /// <summary>The point pairs, for the spline definition; null for a model.</summary>
         public HemiMapping Mapping { get; }
+        /// <summary>The model, or null for the spline definition.</summary>
+        public DefishModel Model { get; }
+        /// <summary>The adjustment the model was evaluated with (a copy), or null.</summary>
+        public DefishAdjustment Adjustment { get; }
+        /// <summary>Height / width of the frame the grid was made for.</summary>
+        public double Aspect { get; }
+        /// <summary>
+        /// The smallest area ratio (photo pixels per defished pixel) over the frame. Near or below zero the result would
+        /// fold over itself: the adjustment goes too far.
+        /// </summary>
+        public double MinAreaScale { get; private set; }
+        public bool Folds => MinAreaScale < 0.02;
 
+        private sealed class SplineMap : IDefishPointMap
+        {
+            private readonly ThinPlateSpline _x, _y;
+
+            public SplineMap(ThinPlateSpline x, ThinPlateSpline y)
+            {
+                _x = x;
+                _y = y;
+            }
+
+            public void Map(double u, double v, out double s, out double t)
+            {
+                s = _x.Eval(u, v);
+                t = _y.Eval(u, v);
+            }
+
+            public void Reset() { }
+        }
+
+        private sealed class ModelPointMap : IDefishPointMap
+        {
+            private readonly DefishModelMap _m;
+
+            public ModelPointMap(DefishModelMap m)
+            {
+                _m = m;
+            }
+
+            public void Map(double u, double v, out double s, out double t)
+            {
+                _m.Map(u, v, out s, out t);
+            }
+
+            public void Reset()
+            {
+                _m.Reset();
+            }
+        }
+
+        /// <summary>The spline definition through the mapping's point pairs (Fisheye Friend's original fit).</summary>
         public DefishGeometry(HemiMapping mapping, double lambda = 1e-5, int nodesAcross = 1025)
+            : this(SplineFactory(mapping, lambda), mapping.TargetHeight > 0 && mapping.TargetWidth > 0 ? (double)mapping.TargetHeight / mapping.TargetWidth : 2.0 / 3.0,
+                nodesAcross, default(System.Threading.CancellationToken))
         {
             Mapping = mapping;
-            mapping.FitInverse(lambda, out _tx, out _ty);
-            double aspect = mapping.TargetHeight > 0 && mapping.TargetWidth > 0 ? (double)mapping.TargetHeight / mapping.TargetWidth : 2.0 / 3.0;
+        }
+
+        private static Func<IDefishPointMap> SplineFactory(HemiMapping mapping, double lambda)
+        {
+            ThinPlateSpline tx, ty;
+            mapping.FitInverse(lambda, out tx, out ty);
+            var shared = new SplineMap(tx, ty);              // stateless: one serves every thread
+            return () => shared;
+        }
+
+        /// <summary>
+        /// The model with an adjustment, for frames of height / width <paramref name="aspect"/> (as the lens saw them).
+        /// About a second for the full grid; <paramref name="nodesAcross"/> = 129 gives a quick preview-quality one.
+        /// </summary>
+        public static DefishGeometry FromModel(DefishModel model, DefishAdjustment adjustment, double aspect, int nodesAcross = 1025,
+            System.Threading.CancellationToken ct = default(System.Threading.CancellationToken))
+        {
+            var adj = (adjustment ?? new DefishAdjustment()).Clone();
+            adj.Validate();
+            return new DefishGeometry(() => new ModelPointMap(new DefishModelMap(model, adj, aspect)), aspect, nodesAcross, ct, model, adj);
+        }
+
+        private DefishGeometry(Func<IDefishPointMap> exact, double aspect, int nodesAcross, System.Threading.CancellationToken ct,
+            DefishModel model = null, DefishAdjustment adjustment = null)
+        {
+            _exact = exact;
+            Model = model;
+            Adjustment = adjustment;
+            Aspect = aspect;
             _hu = 1.0 / (nodesAcross - 1);
-            _hv = _hu / aspect;                     // square cells in pixels for images of the mapping's shape
+            _hv = _hu / aspect;                     // square cells in pixels for images of this shape
             _u0 = -Margin;
             _v0 = -Margin;
             _nu = (int)Math.Ceiling((1 + 2 * Margin) / _hu) + 1;
             _nv = (int)Math.Ceiling((1 + 2 * Margin) / _hv) + 1;
             _s = new float[_nu * _nv];
             _t = new float[_nu * _nv];
-            Parallel.For(0, _nv, j =>
+            var po = new ParallelOptions { CancellationToken = ct };
+            Parallel.For(0, _nv, po, () => _exact(), (j, state, ev) =>
             {
-                double v = _v0 + j * _hv;
-                for (int i = 0; i < _nu; i++)
+                double v = _v0 + j * _hv, s, t;
+                ev.Reset();
+                // start each row at the centre column and work outwards: the warm start then never jumps
+                int mid = (int)Math.Round((0.5 - _u0) / _hu);
+                for (int i = mid; i < _nu; i++)
                 {
-                    double u = _u0 + i * _hu;
-                    _s[j * _nu + i] = (float)_tx.Eval(u, v);
-                    _t[j * _nu + i] = (float)_ty.Eval(u, v);
+                    ev.Map(_u0 + i * _hu, v, out s, out t);
+                    _s[j * _nu + i] = (float)s;
+                    _t[j * _nu + i] = (float)t;
                 }
+                ev.Reset();
+                for (int i = mid - 1; i >= 0; i--)
+                {
+                    ev.Map(_u0 + i * _hu, v, out s, out t);
+                    _s[j * _nu + i] = (float)s;
+                    _t[j * _nu + i] = (float)t;
+                }
+                return ev;
+            }, ev => { });
+            ct.ThrowIfCancellationRequested();
+            MinAreaScale = ComputeMinAreaScale();
+        }
+
+        private double ComputeMinAreaScale()
+        {
+            // d(photo px)/d(defished px) from neighbouring nodes over the frame (with a node to spare at the edges)
+            int i0 = (int)Math.Floor(-_u0 / _hu), i1 = Math.Min(_nu - 2, (int)Math.Ceiling((1 - _u0) / _hu));
+            int j0 = (int)Math.Floor(-_v0 / _hv), j1 = Math.Min(_nv - 2, (int)Math.Ceiling((1 - _v0) / _hv));
+            double worst = double.MaxValue;
+            object gate = new object();
+            Parallel.For(j0, j1 + 1, j =>
+            {
+                double local = double.MaxValue;
+                for (int i = i0; i <= i1; i++)
+                {
+                    int o = j * _nu + i;
+                    double sxx = (_s[o + 1] - _s[o]) / _hu, sxy = (_s[o + _nu] - _s[o]) / (_hv * Aspect);
+                    double syx = (_t[o + 1] - _t[o]) * Aspect / _hu, syy = (_t[o + _nu] - _t[o]) / _hv;
+                    double det = sxx * syy - sxy * syx;
+                    if (det < local) local = det;
+                }
+                lock (gate) if (local < worst) worst = local;
             });
+            return worst;
         }
 
         public int GridNodes => _nu * _nv;
 
-        /// <summary>The exact spline (slow: hundreds of terms).</summary>
+        /// <summary>The exact map (slow: hundreds of spline terms, or a few Newton solves for a model).</summary>
         public void MapExact(double u, double v, out double s, out double t)
         {
-            s = _tx.Eval(u, v);
-            t = _ty.Eval(u, v);
+            var ev = _exact();
+            ev.Reset();
+            ev.Map(u, v, out s, out t);
         }
 
         /// <summary>The interpolated map with its derivatives (normalised units).</summary>

@@ -1,8 +1,12 @@
 {
-    "projectionFile": "defish-hemi-596.json",
+    "projectionFile": "defish-hemi-model.json",
     "projectionName": "Hemi",
 
-    "outputSize": "SameAsPhoto",
+    "defishStrength": 100,
+    "defishHorizontal": 100,
+    "defishVertical": 100,
+
+    "outputSize": "FullDetail",
     "edges": "Extend",
 
     "lanczosLobes": 4,

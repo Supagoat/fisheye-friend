@@ -43,10 +43,14 @@ namespace FisheyeFriend.Core.Defish
         /// blur so each result pixel shows its own, smaller footprint (see <see cref="WarpOptions.Aperture"/>). +0.1-0.3 dB.
         /// </summary>
         public bool ApertureCorrection = true;
+        /// <summary>The user's adjustment of the defish model (strength, horizontal and vertical amounts, shape across the frame).</summary>
+        public DefishAdjustment Adjust = new DefishAdjustment();
 
         public DefishSettings Clone()
         {
-            return (DefishSettings)MemberwiseClone();
+            var c = (DefishSettings)MemberwiseClone();
+            c.Adjust = (Adjust ?? new DefishAdjustment()).Clone();
+            return c;
         }
 
         public void Validate()
@@ -57,18 +61,22 @@ namespace FisheyeFriend.Core.Defish
             if (!Enum.IsDefined(typeof(LightSpace), Light)) Light = LightSpace.Sigmoidal;
             if (double.IsNaN(Radius) || Radius < 1) Radius = 3;
             if (Radius > 4) Radius = 4;
+            if (Adjust == null) Adjust = new DefishAdjustment();
+            Adjust.Validate();
         }
 
         public bool Same(DefishSettings o)
         {
             return o != null && OutputSize == o.OutputSize && Edges == o.Edges && Kernel == o.Kernel && Math.Abs(Radius - o.Radius) < 1e-9 &&
-                   Light == o.Light && Antialias == o.Antialias && ApertureCorrection == o.ApertureCorrection;
+                   Light == o.Light && Antialias == o.Antialias && ApertureCorrection == o.ApertureCorrection &&
+                   (Adjust ?? new DefishAdjustment()).Same(o.Adjust ?? new DefishAdjustment());
         }
 
         public override string ToString()
         {
             return OutputSize + ", " + Edges + ", " + Kernel + (Kernel == WarpKernel.Bicubic ? "" : " " + Radius) + ", " + Light +
-                   (Antialias ? ", AA" : "") + (ApertureCorrection ? ", aperture" : "");
+                   (Antialias ? ", AA" : "") + (ApertureCorrection ? ", aperture" : "") +
+                   (Adjust != null && !Adjust.IsDefault ? ", adjust " + Adjust.Key : "");
         }
     }
 
@@ -97,6 +105,14 @@ namespace FisheyeFriend.Core.Defish
     /// </summary>
     public static class Defisher
     {
+        /// <summary>Height / width of the photo as the lens saw it (in the sensor's landscape frame): the shape a geometry is made for.</summary>
+        public static double SensorAspect(PixelImage upright)
+        {
+            bool swap = Orientation.SwapsAxes(SensorTurn(upright));
+            double w = swap ? upright.Height : upright.Width, h = swap ? upright.Width : upright.Height;
+            return h / w;
+        }
+
         /// <summary>The turn from the upright photo to the landscape frame the projection was measured in.</summary>
         public static int SensorTurn(PixelImage upright)
         {
@@ -193,6 +209,8 @@ namespace FisheyeFriend.Core.Defish
         {
             if (upright == null) throw new ArgumentNullException(nameof(upright));
             if (g == null) throw new ArgumentNullException(nameof(g));
+            if (g.Folds)
+                throw new InvalidOperationException("These defish settings fold the picture over itself near the edges. Lower the horizontal or vertical amount, or the curve.");
             var s = settings.Clone();
             s.Validate();
             int turn = SensorTurn(upright);
@@ -251,6 +269,7 @@ namespace FisheyeFriend.Core.Defish
         public static bool ShapeDiffers(DefishGeometry g, PixelImage upright)
         {
             var m = g.Mapping;
+            if (m == null) return false;        // a model works in the lens' own terms: any frame shape is defished correctly
             double want = m.SourceWidth > 0 && m.SourceHeight > 0 ? (double)m.SourceWidth / m.SourceHeight : 1.5;
             double have = (double)Math.Max(upright.Width, upright.Height) / Math.Min(upright.Width, upright.Height);
             return Math.Abs(have / want - 1) > 0.02;

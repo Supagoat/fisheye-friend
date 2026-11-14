@@ -16,7 +16,7 @@ namespace FisheyeFriendBench
     /// <summary>
     /// Command-line bench for the Fisheye Friend core library (compile it together with Assets/FisheyeFriend/Core).
     /// Images are read and written as PNG. Commands:
-    ///   selftest &lt;pairs.json&gt;                         correctness checks of the projection, warp and defish pipeline
+    ///   selftest &lt;pairs.json&gt; [model.json]            correctness checks of the projection, the model, the warp and the defish pipeline
     ///   analyze &lt;pairs.json&gt; [W H]                    local scale of the projection across the frame
     ///   grid &lt;pairs.json&gt;                             interpolation error of the grid for several grid sizes
     ///   exp-prep &lt;pairs&gt; &lt;scene.png&gt; &lt;prefix&gt; &lt;W&gt; &lt;H&gt; &lt;blur&gt;  ground truth and fisheye capture of a scene
@@ -41,8 +41,12 @@ namespace FisheyeFriendBench
                     case "exp-run": return ExpRun(args);
                     case "ff-replica": return ReplicaCmd(args);
                     case "defish": return DefishCmd(args);
+                    case "model-defish": return ModelDefishCmd(args);
                     case "prof": return ProfCmd(args);
                     case "selftest": return SelfTest(args);
+                    case "jac": return JacCmd(args);
+                    case "tps-dump": return TpsDumpCmd(args);
+                    case "model-check": return ModelCheckCmd(args);
                     default:
                         Console.WriteLine("commands: selftest | analyze | grid | exp-prep | exp-run | ff-replica | defish | prof (see the comment in Bench.cs)");
                         return 1;
@@ -283,6 +287,60 @@ namespace FisheyeFriendBench
             var r2 = Defisher.Process(src, g, s);
             Console.WriteLine("defished " + src.Width + "x" + src.Height + " -> " + r2.Width + "x" + r2.Height + " (" + s + ") in " + sw.ElapsedMilliseconds + " ms");
             File.WriteAllBytes(a[3], PngCodec.Encode(r2));
+            return 0;
+        }
+
+        // model-defish <photo.png> <out.png> [strength=1] [h=1] [v=1] [shapex=a,b,c,d] [shapey=a,b,c,d] [preview=W] [full] [crop]:
+        // the photo defished with the built-in model and an adjustment (or, with preview=W, the panel's quick picture W wide)
+        private static int ModelDefishCmd(string[] a)
+        {
+            var src = ImageIO.MakeUpright(PngCodec.Decode(File.ReadAllBytes(a[1])));
+            var s = new DefishSettings { OutputSize = DefishOutputSize.SameAsPhoto };
+            int preview = 0;
+            var ci = CultureInfo.InvariantCulture;
+            for (int i = 3; i < a.Length; i++)
+            {
+                string k = a[i], v = "";
+                int eq = k.IndexOf('=');
+                if (eq > 0) { v = k.Substring(eq + 1); k = k.Substring(0, eq); }
+                switch (k)
+                {
+                    case "strength": s.Adjust.Strength = double.Parse(v, ci); break;
+                    case "h": s.Adjust.AmountX = double.Parse(v, ci); break;
+                    case "v": s.Adjust.AmountY = double.Parse(v, ci); break;
+                    case "shapex": s.Adjust.ShapeX = Array.ConvertAll(v.Split(','), x => double.Parse(x, ci)); break;
+                    case "shapey": s.Adjust.ShapeY = Array.ConvertAll(v.Split(','), x => double.Parse(x, ci)); break;
+                    case "preview": preview = int.Parse(v, ci); break;
+                    case "full": s.OutputSize = DefishOutputSize.FullDetail; break;
+                    case "crop": s.Edges = DefishEdges.Crop; break;
+                }
+            }
+            s.Validate();
+            var sw = Stopwatch.StartNew();
+            double aspect = Defisher.SensorAspect(src);
+            if (preview > 0)
+            {
+                int n = Math.Max(1, Math.Max(src.Width, src.Height) / 1400), rw, rh;
+                var reduced = DisplayReducer.ReduceToRgba32(src, n, out rw, out rh);
+                long tReduce = sw.ElapsedMilliseconds;
+                sw.Restart();
+                var gq = DefishGeometry.FromModel(DefishModel.Hemi, s.Adjust, aspect, 129);
+                long tGeo = sw.ElapsedMilliseconds;
+                sw.Restart();
+                int ph = (int)Math.Round(preview * (double)src.Height / src.Width);
+                var px = DefishPreview.Render(reduced, rw, rh, Defisher.SensorTurn(src), gq, preview, ph);
+                Console.WriteLine("preview " + preview + "x" + ph + ": reduce " + tReduce + " ms (once per photo), geometry " + tGeo + " ms, picture " + sw.ElapsedMilliseconds + " ms");
+                var img = new PixelImage(preview, ph, 4, 8);
+                Buffer.BlockCopy(px, 0, img.Data8, 0, px.Length);
+                File.WriteAllBytes(a[2], PngCodec.Encode(img));
+                return 0;
+            }
+            var g = DefishGeometry.FromModel(DefishModel.Hemi, s.Adjust, aspect);
+            Console.WriteLine("geometry " + sw.ElapsedMilliseconds + " ms" + (g.Folds ? " - FOLDS" : "") + ", min area scale " + g.MinAreaScale.ToString("0.000"));
+            sw.Restart();
+            var r = Defisher.Process(src, g, s);
+            Console.WriteLine("defished " + src.Width + "x" + src.Height + " -> " + r.Width + "x" + r.Height + " (" + s + ") in " + sw.ElapsedMilliseconds + " ms");
+            File.WriteAllBytes(a[2], PngCodec.Encode(r));
             return 0;
         }
 
@@ -549,8 +607,335 @@ namespace FisheyeFriendBench
                 Check(threw, "malformed mapping is reported");
             }
 
+            ModelSelfTest(g, a.Length > 2 ? a[2] : null);
+
             Console.WriteLine(_fails == 0 ? "ALL PASSED" : _fails + " FAILED");
             return _fails == 0 ? 0 : 1;
+        }
+
+        /// <summary>The defish model and its adjustment: against the point pairs' splines, and its promises.</summary>
+        private static void ModelSelfTest(DefishGeometry splines, string modelPath)
+        {
+            const double A = 2.0 / 3.0;
+            var model = modelPath != null ? DefishModel.Parse(File.ReadAllText(modelPath)) : DefishModel.Hemi;
+
+            // the shipped file is the built-in model, and JSON round-trips exactly
+            {
+                var hemi = DefishModel.Hemi;
+                var back = DefishModel.Parse(model.ToJson());
+                Check(SameModel(model, hemi), "model file " + (modelPath != null ? Path.GetFileName(modelPath) : "(built in)") + " has the built-in coefficients");
+                Check(SameModel(model, back), "model JSON round trip");
+                bool threw = false;
+                try { DefishModel.Parse("{\"format\": \"fisheye-friend-defish-model\", \"lens\": {}}"); } catch (FormatException) { threw = true; }
+                Check(threw, "incomplete model file is reported");
+            }
+
+            var g = DefishGeometry.FromModel(model, new DefishAdjustment(), A);
+            // matches the point pairs (the hand-measured defish) over the frame
+            {
+                double sum = 0, mx = 0;
+                int n = 0;
+                for (int j = 0; j < 60; j++)
+                    for (int i = 0; i < 90; i++)
+                    {
+                        double u = (i + 0.5) / 90, v = (j + 0.5) / 60, s1, t1, s2, t2, q0, q1, q2, q3;
+                        g.Map(u, v, out s1, out t1, out q0, out q1, out q2, out q3);
+                        splines.Map(u, v, out s2, out t2, out q0, out q1, out q2, out q3);
+                        double d = Math.Sqrt(Math.Pow((s1 - s2) * 6000, 2) + Math.Pow((t1 - t2) * 4000, 2));
+                        sum += d * d;
+                        n++;
+                        mx = Math.Max(mx, d);
+                    }
+                double rms = Math.Sqrt(sum / n);
+                Check(rms < 1.2 && mx < 3, "model vs point-pair splines on 6000 x 4000: rms " + rms.ToString("0.00") + " px, max " + mx.ToString("0.00") + " px");
+            }
+            double ge = g.MaxGridError(7952, 5304, 20000, 7);
+            Check(ge < 0.01, "model grid error at 7952 x 5304: " + ge.ToString("0.0000") + " px");
+            {
+                var rnd = new Random(9);
+                double ue = 0;
+                for (int k = 0; k < 2000; k++)
+                {
+                    double u = 0.02 + 0.96 * rnd.NextDouble(), v = 0.02 + 0.96 * rnd.NextDouble(), s0, t0, q0, q1, q2, q3, uu, vv;
+                    g.Map(u, v, out s0, out t0, out q0, out q1, out q2, out q3);
+                    bool ok = g.Unmap(s0, t0, out uu, out vv);
+                    ue = Math.Max(ue, ok ? Math.Max(Math.Abs(uu - u), Math.Abs(vv - v)) : 1);
+                }
+                Check(ue < 1e-8, "model Unmap(Map) round trip " + ue.ToString("0.0e0"));
+            }
+
+            // symmetric left-right and top-bottom, and vertical lines come out straight (x depends on the column only)
+            {
+                var mm = new DefishModelMap(model, new DefishAdjustment { Strength = 0.9, AmountX = 1.2, AmountY = 0.7, ShapeX = new[] { 1, 1.1, 0.8, 0.6 } }, A);
+                double sym = 0;
+                var rnd = new Random(4);
+                for (int k = 0; k < 500; k++)
+                {
+                    double u = rnd.NextDouble(), v = rnd.NextDouble(), s, t, s2, t2;
+                    mm.Reset(); mm.Map(u, v, out s, out t);
+                    mm.Reset(); mm.Map(1 - u, v, out s2, out t2);
+                    sym = Math.Max(sym, Math.Max(Math.Abs(s + s2 - 1), Math.Abs(t - t2)));
+                    mm.Reset(); mm.Map(u, 1 - v, out s2, out t2);
+                    sym = Math.Max(sym, Math.Max(Math.Abs(s - s2), Math.Abs(t + t2 - 1)));
+                }
+                Check(sym < 1e-9, "adjusted model is symmetric: " + sym.ToString("0.0e0"));
+            }
+
+            // no adjustment at all (both amounts 0) leaves the photo as it is, at any strength and curve
+            {
+                double idm = 0;
+                foreach (var st in new[] { 0.5, 1.0, 1.15 })
+                {
+                    var mm = new DefishModelMap(model, new DefishAdjustment { Strength = st, AmountX = 0, AmountY = 0, ShapeY = new[] { 2.0, 0, 1, 2 } }, A);
+                    for (int j = 0; j <= 10; j++)
+                        for (int i = 0; i <= 10; i++)
+                        {
+                            double s, t;
+                            mm.Map(i / 10.0, j / 10.0, out s, out t);
+                            idm = Math.Max(idm, Math.Max(Math.Abs(s - i / 10.0), Math.Abs(t - j / 10.0)));
+                        }
+                }
+                Check(idm < 1e-12, "amounts at 0 leave the photo unchanged: " + idm.ToString("0.0e0"));
+            }
+
+            // at any strength the result's left and right edges read from the photo's edges (the width is kept; the measured
+            // defish itself reaches about 1.7 px past them)
+            {
+                double we = 0;
+                foreach (var st in new[] { 0.5, 0.75, 1.0, 1.15 })
+                {
+                    var mm = new DefishModelMap(model, new DefishAdjustment { Strength = st }, A);
+                    double s, t;
+                    mm.Map(1, 0.5, out s, out t);
+                    we = Math.Max(we, Math.Abs(s - 1) * 6000);
+                    mm.Reset();
+                    mm.Map(0, 0.5, out s, out t);
+                    we = Math.Max(we, Math.Abs(s) * 6000);
+                }
+                Check(we < 3, "every strength keeps the width: the edges read within " + we.ToString("0.0") + " px of the photo's edges (6000 wide)");
+            }
+
+            // a stronger lens sees more; the strength changes the defish the way it should (more correction at the edges)
+            {
+                double f0 = model.DiagonalFieldOfView(A, 0.5), f1 = model.DiagonalFieldOfView(A), f2 = model.DiagonalFieldOfView(A, 1.15);
+                Check(f0 < f1 && f1 < f2 && Math.Abs(f1 - 177) < 1, "field of view " + f0.ToString("0") + "° / " + f1.ToString("0") + "° / " + f2.ToString("0") + "° at 50 / 100 / 115%");
+                // how far the defish moves the frame's corner and a point two thirds of the way along the diagonal
+                double prev = 0;
+                bool mono = true;
+                string seen = "";
+                foreach (var st in new[] { 0.5, 0.8, 1.0, 1.15 })
+                {
+                    var mm = new DefishModelMap(model, new DefishAdjustment { Strength = st }, A);
+                    double s, t;
+                    mm.Map(1.0 / 6, 1.0 / 6, out s, out t);
+                    double d = Math.Sqrt(Math.Pow((s - 1.0 / 6) * 6000, 2) + Math.Pow((t - 1.0 / 6) * 4000, 2));
+                    mono &= d > prev;
+                    prev = d;
+                    seen += (seen.Length > 0 ? " / " : "") + d.ToString("0");
+                }
+                Check(mono, "a stronger lens gets more correction: a point two thirds out moves " + seen + " px at 50 / 80 / 100 / 115%");
+            }
+
+            // no folds anywhere in the range the interface offers with flat curves; folds are found when they happen
+            {
+                bool any = false;
+                double worst = double.MaxValue;
+                foreach (var st in new[] { DefishAdjustment.MinStrength, 1.0, DefishAdjustment.MaxStrength })
+                    foreach (var ax in new[] { 0.0, 0.5, 1.0, DefishAdjustment.MaxAmount })
+                        foreach (var ay in new[] { 0.0, 1.0, DefishAdjustment.MaxAmount })
+                        {
+                            var gq = DefishGeometry.FromModel(model, new DefishAdjustment { Strength = st, AmountX = ax, AmountY = ay }, A, 257);
+                            any |= gq.Folds;
+                            worst = Math.Min(worst, gq.MinAreaScale);
+                        }
+                Check(!any, "no folds over strength 50-115%, amounts 0-150% (smallest area scale " + worst.ToString("0.000") + ")");
+                // ordinary curves are safe; a zig-zag between 0 and 200% does fold, and is found
+                bool curved = false;
+                double least = double.MaxValue;
+                foreach (var shape in new[] { new[] { 1, 1, 0.5, 0 }, new[] { 0.5, 0.7, 1, 1.4 }, new[] { 1, 1, 1.5, 1.5 }, new[] { 2.0, 0, 2, 0 } })
+                {
+                    var gc = DefishGeometry.FromModel(model, new DefishAdjustment { ShapeX = shape, ShapeY = shape }, A, 257);
+                    curved |= gc.Folds;
+                    least = Math.Min(least, gc.MinAreaScale);
+                }
+                Check(!curved, "no folds with ordinary curves at 100% (smallest area scale " + least.ToString("0.000") + ")");
+                var zig = DefishGeometry.FromModel(model, new DefishAdjustment { ShapeX = new[] { 0.0, 2, 0, 2 }, ShapeY = new[] { 0.0, 2, 0, 2 } }, A, 257);
+                Check(zig.Folds, "a zig-zag curve (0 / 200 / 0 / 200%) is found to fold (area scale " + zig.MinAreaScale.ToString("0.000") + ")");
+                var fold = DefishGeometry.FromModel(model, new DefishAdjustment { AmountX = 1.5, AmountY = 1.5, ShapeX = new[] { 0, 0, 2.0, 2 } }, A, 257);
+                Console.WriteLine("      (steepest curve at 150%: area scale " + fold.MinAreaScale.ToString("0.000") + (fold.Folds ? ", folds" : "") + ")");
+            }
+
+            // the shape curves pass through their points and never overshoot them
+            {
+                var sh = new[] { 1.0, 1.0, 0.5, 0.0 };
+                bool through = Math.Abs(DefishAdjustment.ShapeAt(sh, 0) - 1) < 1e-12 && Math.Abs(DefishAdjustment.ShapeAt(sh, 1.0 / 3) - 1) < 1e-12 &&
+                               Math.Abs(DefishAdjustment.ShapeAt(sh, 2.0 / 3) - 0.5) < 1e-12 && Math.Abs(DefishAdjustment.ShapeAt(sh, 1)) < 1e-12;
+                bool mono = true;
+                double last = 2;
+                for (int i = 0; i <= 300; i++)
+                {
+                    double v = DefishAdjustment.ShapeAt(sh, i / 300.0);
+                    mono &= v <= last + 1e-12 && v >= -1e-12 && v <= 1 + 1e-12;
+                    last = v;
+                }
+                Check(through && mono, "shape curve passes through its points without overshoot");
+                var bad = new DefishAdjustment { Strength = 9, AmountX = -1, AmountY = double.NaN, ShapeX = new[] { 5.0 }, ShapeY = null };
+                bad.Validate();
+                Check(bad.Strength == DefishAdjustment.MaxStrength && bad.AmountX == 0 && bad.AmountY == 1 && bad.ShapeX.Length == 4 && bad.ShapeX[0] == 2 &&
+                      bad.ShapeX[3] == 1 && bad.ShapeY.Length == 4, "out-of-range adjustments are clamped");
+                var k1 = new DefishAdjustment { AmountX = 0.9 };
+                Check(!k1.Same(new DefishAdjustment()) && k1.Same(k1.Clone()) && new DefishAdjustment().IsDefault && !k1.IsDefault, "adjustment identity (Key, Same, IsDefault)");
+                var s1 = new DefishSettings();
+                var s2 = s1.Clone();
+                s2.Adjust.ShapeY[2] = 0.7;
+                Check(!s1.Same(s2) && s1.Adjust.ShapeY[2] == 1, "settings clone deeply and tell adjustments apart");
+            }
+
+            // the panel's preview: with no correction it reproduces the photo; a portrait is the turned landscape picture
+            {
+                var src = Noise(120, 80, 4, 8, 51);
+                for (int i = 3; i < src.Data8.Length; i += 4) src.Data8[i] = 255;
+                var id = DefishGeometry.FromModel(model, new DefishAdjustment { AmountX = 0, AmountY = 0 }, A, 129);
+                var pic = DefishPreview.Render(src.Data8, 120, 80, Orientation.Normal, id, 120, 80);
+                int md = 0;
+                for (int i = 0; i < pic.Length; i++) md = Math.Max(md, Math.Abs(pic[i] - src.Data8[i]));
+                Check(md <= 1, "preview with no correction reproduces the photo (max diff " + md + ")");
+
+                var gq = DefishGeometry.FromModel(model, new DefishAdjustment(), A, 129);
+                var land = DefishPreview.Render(src.Data8, 120, 80, Orientation.Normal, gq, 120, 80);
+                var portrait = Orientation.Apply(src, Orientation.Rotate90Clockwise);   // 80 x 120, as displayed
+                var picP = DefishPreview.Render(portrait.Data8, 80, 120, Orientation.Rotate90CounterClockwise, gq, 80, 120);
+                var landImg = new PixelImage(120, 80, 4, 8);
+                Buffer.BlockCopy(land, 0, landImg.Data8, 0, land.Length);
+                var expect = Orientation.Apply(landImg, Orientation.Rotate90Clockwise);
+                int mp = 0;
+                for (int i = 0; i < picP.Length; i++) mp = Math.Max(mp, Math.Abs(picP[i] - expect.Data8[i]));
+                Check(mp <= 1, "portrait preview is the turned landscape preview (max diff " + mp + ")");
+                var flipped = DefishPreview.Render(src.Data8, 120, 80, Orientation.Normal, gq, 120, 80, true);
+                bool rows = true;
+                for (int x = 0; x < 120 * 4; x++) rows &= flipped[x] == land[79 * 120 * 4 + x];
+                Check(rows, "preview bottom-up rows for the texture");
+                var sw = Stopwatch.StartNew();
+                var big = Noise(1400, 933, 4, 8, 52);
+                var gq2 = DefishGeometry.FromModel(model, new DefishAdjustment { Strength = 0.9 }, A, 129);
+                DefishPreview.Render(big.Data8, 1400, 933, Orientation.Normal, gq2, 660, 440, true);
+                Console.WriteLine("      (preview geometry + 660 x 440 picture: " + sw.ElapsedMilliseconds + " ms)");
+            }
+
+            // the defisher uses the model: full detail follows the strength, and a portrait is the turned landscape
+            {
+                var land = Noise(240, 160, 3, 8, 61);
+                var s = new DefishSettings { Adjust = new DefishAdjustment { Strength = 0.8, AmountY = 0.6 } };
+                var gm = DefishGeometry.FromModel(model, s.Adjust, A, 257);
+                var rl = Defisher.Process(land, gm, s);
+                var portrait = Orientation.Apply(land, Orientation.Rotate90Clockwise);
+                portrait.Metadata.SourceOrientation = Orientation.Rotate90Clockwise;
+                Check(Math.Abs(Defisher.SensorAspect(portrait) - A) < 1e-12, "a portrait's lens frame is landscape");
+                var rp = Defisher.Process(portrait, gm, s);
+                Check(MaxDiff(rp, Orientation.Apply(rl, Orientation.Rotate90Clockwise), 3) == 0, "adjusted portrait equals the turned landscape result");
+                double k0 = Defisher.CentreScale(DefishGeometry.FromModel(model, new DefishAdjustment { Strength = 0.5 }, A, 257), 600, 400);
+                double k1 = Defisher.CentreScale(g, 600, 400);
+                double k2 = Defisher.CentreScale(DefishGeometry.FromModel(model, new DefishAdjustment { Strength = 1.15 }, A, 257), 600, 400);
+                Check(k0 < k1 && k1 < k2 && Math.Abs(k1 - 1.19) < 0.02, "centre scale grows with strength: " + k0.ToString("0.000") + " / " + k1.ToString("0.000") + " / " + k2.ToString("0.000"));
+                var folding = new DefishGeometry[] { DefishGeometry.FromModel(model, new DefishAdjustment { AmountX = 1.5, AmountY = 1.5, ShapeX = new[] { 0, 0, 2.0, 2 } }, A, 257) };
+                if (folding[0].Folds)
+                {
+                    bool threw = false;
+                    try { Defisher.Process(land, folding[0], s); } catch (InvalidOperationException) { threw = true; }
+                    Check(threw, "folding settings are refused, not rendered");
+                }
+            }
+        }
+
+        private static bool SameModel(DefishModel a, DefishModel b)
+        {
+            bool same = a.Theta.Length == b.Theta.Length && a.Horizontal.Length == b.Horizontal.Length &&
+                        a.Vertical.GetLength(0) == b.Vertical.GetLength(0) && a.Vertical.GetLength(1) == b.Vertical.GetLength(1) &&
+                        a.Scale == b.Scale && a.Panini == b.Panini && a.PaniniVertical == b.PaniniVertical;
+            if (!same) return false;
+            for (int i = 0; i < a.Theta.Length; i++) same &= a.Theta[i] == b.Theta[i];
+            for (int i = 0; i < a.Horizontal.Length; i++) same &= a.Horizontal[i] == b.Horizontal[i];
+            for (int i = 0; i < a.Vertical.GetLength(0); i++)
+                for (int j = 0; j < a.Vertical.GetLength(1); j++) same &= a.Vertical[i, j] == b.Vertical[i, j];
+            return same;
+        }
+
+        // model-check <pairs> <model.json> <ref_points.json>: the C# model against the Python reference, the splines, and its speed
+        private static int ModelCheckCmd(string[] a)
+        {
+            var model = DefishModel.Parse(File.ReadAllText(a[2]));
+            var refs = Json.Parse(File.ReadAllText(a[3])) as List<object>;
+            double worst = 0;
+            foreach (var o in refs)
+            {
+                var r = (List<object>)o;
+                double x = (double)r[0], y = (double)r[1];
+                var adj = new DefishAdjustment { Strength = (double)r[2], AmountX = (double)r[3], AmountY = (double)r[4] };
+                var mm = new DefishModelMap(model, adj, 2.0 / 3.0);
+                double s, t;
+                mm.Map(x + 0.5, y / (2.0 / 3.0) + 0.5, out s, out t);
+                double ex = (double)r[5], ey = (double)r[6];
+                worst = Math.Max(worst, Math.Max(Math.Abs((s - 0.5) - ex), Math.Abs((t - 0.5) * 2 / 3 - ey)) * 6000);
+            }
+            Console.WriteLine("C# vs Python reference: " + refs.Count + " points, max difference " + worst.ToString("0.000000") + " px (6000 wide)");
+            var sw = Stopwatch.StartNew();
+            var g = DefishGeometry.FromModel(model, new DefishAdjustment(), 2.0 / 3.0);
+            Console.WriteLine("model grid built in " + sw.ElapsedMilliseconds + " ms (" + g.GridNodes + " nodes), grid error " + g.MaxGridError(7952, 5304, 20000, 3).ToString("0.0000") +
+                              " px on 7952 x 5304, min area scale " + g.MinAreaScale.ToString("0.000"));
+            sw.Restart();
+            var quick = DefishGeometry.FromModel(model, new DefishAdjustment(), 2.0 / 3.0, 129);
+            Console.WriteLine("preview grid (129 across) in " + sw.ElapsedMilliseconds + " ms, grid error " + quick.MaxGridError(7952, 5304, 5000, 3).ToString("0.00") + " px");
+            var tps = Geo(a[1]);
+            double sum = 0, mx = 0; int n = 0; double wx = 0, wy = 0;
+            for (int j = 0; j < 80; j++)
+                for (int i = 0; i < 120; i++)
+                {
+                    double u = (i + 0.5) / 120, v = (j + 0.5) / 80, s1, t1, s2, t2;
+                    g.MapExact(u, v, out s1, out t1);
+                    tps.MapExact(u, v, out s2, out t2);
+                    double d = Math.Sqrt(Math.Pow((s1 - s2) * 6000, 2) + Math.Pow((t1 - t2) * 4000, 2));
+                    sum += d * d; n++;
+                    if (d > mx) { mx = d; wx = u; wy = v; }
+                }
+            Console.WriteLine("model vs splines over the frame (photo px, 6000 x 4000): rms " + Math.Sqrt(sum / n).ToString("0.00") + ", max " + mx.ToString("0.00") +
+                              " at (" + (wx * 6000).ToString("0") + ", " + (wy * 4000).ToString("0") + ")");
+            foreach (var st in new[] { 0.5, 0.7, 0.85, 1.0, 1.1, 1.15 })
+            {
+                var gs = DefishGeometry.FromModel(model, new DefishAdjustment { Strength = st }, 2.0 / 3.0, 257);
+                Console.WriteLine("  strength " + st.ToString("0.00") + ": diagonal FOV " + model.DiagonalFieldOfView(2.0 / 3.0, st).ToString("0") + " deg, centre scale " +
+                                  Defisher.CentreScale(gs, 6000, 4000).ToString("0.000") + ", min area scale " + gs.MinAreaScale.ToString("0.000"));
+            }
+            return 0;
+        }
+
+        // tps-dump <pairs> <nx> <ny> <out.csv>: the exact spline map (output -> source, normalised) on an nx x ny grid of the output
+        private static int TpsDumpCmd(string[] a)
+        {
+            var g = Geo(a[1]);
+            int nx = int.Parse(a[2]), ny = int.Parse(a[3]);
+            var sb = new System.Text.StringBuilder("u,v,s,t\n");
+            for (int j = 0; j < ny; j++)
+                for (int i = 0; i < nx; i++)
+                {
+                    double u = (i + 0.5) / nx, v = (j + 0.5) / ny, s, t;
+                    g.MapExact(u, v, out s, out t);
+                    sb.Append(u.ToString("R", CultureInfo.InvariantCulture)).Append(',').Append(v.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(s.ToString("R", CultureInfo.InvariantCulture)).Append(',').Append(t.ToString("R", CultureInfo.InvariantCulture)).Append('\n');
+                }
+            File.WriteAllText(a[4], sb.ToString());
+            return 0;
+        }
+
+        // jac <pairs> <W> <H> <x> <y>: source position and Jacobian d(src px)/d(out px) at an output pixel (same-size output)
+        private static int JacCmd(string[] a)
+        {
+            var g = Geo(a[1]);
+            int W = int.Parse(a[2]), H = int.Parse(a[3]);
+            var map = new DefishWarpMap(g, W, H, W, H);
+            double sx, sy, j00, j01, j10, j11;
+            map.Map(double.Parse(a[4], CultureInfo.InvariantCulture), double.Parse(a[5], CultureInfo.InvariantCulture), out sx, out sy, out j00, out j01, out j10, out j11);
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "src ({0:0.00}, {1:0.00})  J = [[{2:0.0000}, {3:0.0000}], [{4:0.0000}, {5:0.0000}]]", sx, sy, j00, j01, j10, j11));
+            return 0;
         }
 
         // prof <pairs> <W> <H>: cost of the map evaluation alone, and of the warp on a synthetic image, best of 3
