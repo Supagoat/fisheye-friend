@@ -31,6 +31,10 @@ keeps running in the background so batches don't pause, Retina on). Re-apply any
 **Fisheye Friend > Apply Recommended Player Settings**. The same menu opens the config file and clears the
 remembered settings.
 
+To save battery the app draws at most 30 frames a second while you're using it, 15 when idle, and 5 when it's in
+the background with nothing to do (`App/FramePacer.cs`; vSync is off, else Unity would redraw at the display's
+full refresh rate). Jobs run on worker threads and don't wait on frames, so they aren't slowed down.
+
 ## Interactive mode
 
 | Action | How |

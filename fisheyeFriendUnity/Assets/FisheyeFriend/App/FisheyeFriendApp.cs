@@ -37,6 +37,8 @@ namespace FisheyeFriend.App
         private bool _messageIsError;
         private string _tooltip = "";
         private string _frameTooltip = "";
+        private readonly FramePacer _pacer = new FramePacer();
+        private bool _showTooltips = true;     // remembered (loaded in Awake)
         private bool _projectionReported;
         private readonly Queue<Action> _deferred = new Queue<Action>();
 
@@ -54,6 +56,7 @@ namespace FisheyeFriend.App
         private void Update()
         {
             Projection.Tick();
+            _pacer.Tick(_interactive.Busy || _batch.Busy || (!Projection.Ready && !Projection.Failed));
             _panel.Tick(Settings, _mode == Mode.Interactive ? _interactive.Original : null, Projection);
             if (!_projectionReported && Projection.Failed)
             {
@@ -79,7 +82,8 @@ namespace FisheyeFriend.App
         private void Awake()
         {
             Application.runInBackground = true;   // keep batches running when the window is in the background
-            Application.targetFrameRate = 60;
+            _pacer.Start();                       // 30 fps at most, less when idle (see FramePacer)
+            _showTooltips = Prefs.GetBool("ShowTooltips", true);
             string warning;
             Config = AppConfig.Load(out warning);
             Settings = Prefs.LoadSettings(Config.CreateDefaultSettings());
@@ -145,6 +149,7 @@ namespace FisheyeFriend.App
 
         private void OnGUI()
         {
+            _pacer.Observe(Event.current);
             float scale = ComputeUiScale();
             if (!_ui.IsBuiltFor(scale)) _ui.Build(scale);
             if (Event.current.type == EventType.Repaint) _frameTooltip = "";
@@ -189,6 +194,12 @@ namespace FisheyeFriend.App
             if (GUILayout.Button(new GUIContent("Batch", "Defish every photo in a folder"), _mode == Mode.Batch ? _ui.TabSelected : _ui.Tab))
                 Defer(() => SetMode(Mode.Batch));
             GUILayout.FlexibleSpace();
+            if (GUILayout.Button(new GUIContent("Tips", _showTooltips ? "Hide these explanations when hovering over controls" : "Show explanations when hovering over controls"),
+                    _showTooltips ? _ui.TabSelected : _ui.Tab))
+            {
+                _showTooltips = !_showTooltips;
+                Prefs.SetBool("ShowTooltips", _showTooltips);
+            }
             if (GUILayout.Button(new GUIContent("Config", "Open the folder holding " + AppConfig.FileName + " (defaults and the projection file). Restart the app after editing."), _ui.Tab))
                 Defer(RevealConfig);
             GUILayout.EndHorizontal();
@@ -253,7 +264,7 @@ namespace FisheyeFriend.App
 
         private void DrawTooltip(Rect screen)
         {
-            if (Event.current.type == EventType.Repaint) _tooltip = _frameTooltip;
+            if (Event.current.type == EventType.Repaint) _tooltip = _showTooltips ? _frameTooltip : "";
             if (string.IsNullOrEmpty(_tooltip) || Event.current.type != EventType.Repaint) return;
             var content = new GUIContent(_tooltip);
             float width = _ui.S(300);

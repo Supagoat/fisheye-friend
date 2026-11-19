@@ -175,8 +175,10 @@ namespace FisheyeFriend.Gpu
         }
 
         /// <summary>
-        /// Defishes an upright photo, as <see cref="Defisher.Process"/> does, without blocking Unity's frames: preparation
-        /// and unpacking on worker threads, the GPU's results read back asynchronously. Start it on the main thread.
+        /// Defishes an upright photo, as <see cref="Defisher.Process"/> does, keeping the window alive: preparation and
+        /// unpacking on worker threads; each strip is read back as soon as the GPU has it, and a frame is let through about
+        /// five times a second (for the progress bar). It never waits a frame per strip, so the app's frame rate (lowered
+        /// to save battery, see FramePacer) doesn't slow it down. Start it on the main thread.
         /// </summary>
         public async Task<PixelImage> ProcessAsync(PixelImage upright, DefishGeometry g, DefishSettings settings,
             ProgressTracker progress = null, CancellationToken ct = default)
@@ -186,19 +188,27 @@ namespace FisheyeFriend.Gpu
             var job = await Task.Run(() => GpuPlan.Job.Prepare(upright, g, settings), ct);
             ct.ThrowIfCancellationRequested();
             var output = job.NewOutput();
+            var unpacking = new System.Collections.Generic.List<Task>();
             using (var run = new WarpRun(this, job))
             {
                 int strip = Strip(job);
+                var sinceFrame = System.Diagnostics.Stopwatch.StartNew();
                 for (int y0 = 0; y0 < job.OutH; y0 += strip)
                 {
                     ct.ThrowIfCancellationRequested();
                     int rows = Math.Min(strip, job.OutH - y0), start = y0;
                     run.Dispatch(y0, rows);
-                    var words = await run.ReadAsync(rows);
-                    await Task.Run(() => GpuPlan.Unpack(words, output, start, rows), ct);
+                    var words = run.Read(rows);                   // waits for this strip on the GPU (tens of milliseconds)
+                    unpacking.Add(Task.Run(() => GpuPlan.Unpack(words, output, start, rows), ct));
                     if (progress != null) progress.Report((float)(y0 + rows) / job.OutH);
+                    if (sinceFrame.ElapsedMilliseconds > 200 && y0 + rows < job.OutH)
+                    {
+                        await Task.Yield();                       // one frame, so the window and the progress bar update
+                        sinceFrame.Restart();
+                    }
                 }
             }
+            await Task.WhenAll(unpacking);
             ct.ThrowIfCancellationRequested();
             return await Task.Run(() => job.Finish(output), ct);
         }
@@ -303,19 +313,6 @@ namespace FisheyeFriend.Gpu
                 var r = new uint[rows * _job.OutW * _wpp];
                 _out.GetData(r, 0, 0, r.Length);
                 return r;
-            }
-
-            public Task<uint[]> ReadAsync(int rows)
-            {
-                int count = rows * _job.OutW * _wpp;
-                if (!SystemInfo.supportsAsyncGPUReadback) return Task.FromResult(Read(rows));
-                var tcs = new TaskCompletionSource<uint[]>();
-                AsyncGPUReadback.Request(_out, count * 4, 0, req =>
-                {
-                    if (req.hasError) tcs.TrySetException(new InvalidOperationException("Reading the result back from the GPU failed."));
-                    else tcs.TrySetResult(req.GetData<uint>().ToArray());
-                });
-                return tcs.Task;
             }
 
             public void Dispose()

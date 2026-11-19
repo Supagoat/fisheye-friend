@@ -18,7 +18,7 @@ namespace FisheyeFriend.App
         {
             "OutputSize", "Edges", "Kernel", "Radius", "Light", "Antialias", "Aperture", "DefishOnOpen",
             "Strength", "AmountX", "AmountY", "ShapeX", "ShapeY", "DefishLinked", "UseGpu",
-            "SaveFormat", "OpenDir", "SaveDir", "Mode", "BatchIn", "BatchOut", "BatchSubfolders", "BatchOverwrite", "BatchSuffix", "SettingsVersion",
+            "SaveFormat", "OpenDir", "SaveDir", "Mode", "ShowTooltips", "BatchIn", "BatchOut", "BatchSubfolders", "BatchOverwrite", "BatchSuffix", "SettingsVersion",
         };
 
         public static string GetString(string key, string fallback)
